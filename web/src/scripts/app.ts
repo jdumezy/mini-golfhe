@@ -1,4 +1,5 @@
-import { HOLES, PHYSICS, playback, shotState, simulate, type Playback, type Shot, type Vec2 } from "../lib/golf";
+import { HOLES, PHYSICS, playback, shotState, type Playback, type Shot, type Vec2 } from "../lib/golf";
+import * as fhe from "../lib/fhe/client";
 import { CourseView, type Aim } from "../lib/render/CourseView";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -46,7 +47,10 @@ function saveRound() {
 let round = loadRound();
 let phase: Phase = round.scores.every((s) => s !== null) ? "finished" : "aiming";
 let message = "";
-let lastShot: { aim: Aim; shot: Shot; pb: Playback; simulateMs: number; playbackMs: number } | null = null;
+let lastShot: { aim: Aim; shot: Shot; pb: Playback; playbackMs: number } | null = null;
+let lastStats: fhe.ShotStats | null = null;
+/** Waiting for the client to encrypt, have the server simulate, and decrypt. */
+let requesting = false;
 
 const parTotal = HOLES.reduce((s, h) => s + h.spec.par, 0);
 
@@ -96,12 +100,27 @@ async function shoot(aim: Aim) {
   round.strokes++;
   lastPower = aim.power;
 
+  requesting = true;
+  refresh();
+  let result: fhe.ShotResult;
+  try {
+    result = await fhe.shoot(hole.index, shotState(from, aim.angle, aim.power));
+  } catch (e) {
+    // The shot never happened.
+    requesting = false;
+    round.strokes--;
+    phase = "aiming";
+    message = `error: ${e instanceof Error ? e.message : String(e)}`;
+    view.setAimEnabled(true);
+    refresh();
+    refreshClientStatus();
+    return;
+  }
+  requesting = false;
+  lastStats = result.stats;
   const t0 = performance.now();
-  const shot = simulate(hole, shotState(from, aim.angle, aim.power));
-  const t1 = performance.now();
-  const pb = playback(hole, shot);
-  const t2 = performance.now();
-  lastShot = { aim, shot, pb, simulateMs: t1 - t0, playbackMs: t2 - t1 };
+  const pb = playback(hole, result.shot);
+  lastShot = { aim, shot: result.shot, pb, playbackMs: performance.now() - t0 };
   refresh();
 
   await view.play(pb);
@@ -222,6 +241,7 @@ function setPanelOpen(open: boolean) {
   clearInterval(statsTimer);
   if (open) {
     refresh();
+    refreshClientStatus();
     statsTimer = window.setInterval(refreshRenderStats, 250);
   }
 }
@@ -231,7 +251,53 @@ $("nerd-close").addEventListener("click", () => setPanelOpen(false));
 
 const stat = (name: string) => panel.querySelector<HTMLElement>(`[data-stat="${name}"]`)!;
 const fmt = (v: number, d = 3) => v.toFixed(d);
-const formatMs = (ms: number) => (ms < 10 ? `${ms.toFixed(2)} ms` : `${ms.toFixed(0)} ms`);
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KiB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1) return `${(ms * 1000).toFixed(0)} µs`;
+  if (ms < 1000) return `${ms.toFixed(1)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+async function refreshClientStatus() {
+  let s: fhe.Status | null = null;
+  try {
+    s = await fhe.fetchStatus();
+  } catch {}
+  if (!s) {
+    for (const name of ["fheScheme", "fheServer", "fheSimulation", "fheKey"]) stat(name).textContent = "–";
+    stat("fheClient").textContent = "not running";
+    return;
+  }
+  const { client, server } = s;
+  stat("fheScheme").textContent = client.scheme;
+  stat("fheClient").textContent = `running, v${client.version}`;
+  stat("fheServer").textContent = server.error
+    ? `${server.reachable ? "reachable" : "unreachable"} at ${server.addr}: ${server.error}`
+    : `reachable at ${server.addr}`;
+  stat("fheSimulation").textContent =
+    server.max_contacts !== null
+      ? `${server.max_contacts} contacts × ${server.steps} steps of ${(server.dt! * 1000).toFixed(0)} ms`
+      : "–";
+  stat("fheKey").textContent = `${formatBytes(client.eval_key_bytes)} (keygen ${formatMs(client.keygen_ms)})`;
+}
+
+function refreshLastShot() {
+  const s = lastStats;
+  if (!s) return;
+  stat("fheCiphertexts").textContent = `${formatBytes(s.shot_bytes)} / ${formatBytes(s.trajectory_bytes)}`;
+  stat("fheTraffic").textContent = `${formatBytes(s.upload_bytes)} / ${formatBytes(s.download_bytes)}`;
+  stat("fheEncrypt").textContent = formatMs(s.encrypt_ms);
+  stat("fheSimulate").textContent = formatMs(s.simulate_ms);
+  stat("fheDecrypt").textContent = formatMs(s.decrypt_ms);
+  stat("fheTotal").textContent = `${formatMs(s.network_ms)} / ${formatMs(s.total_ms)}`;
+  stat("fheContacts").textContent = `${s.contacts} / ${s.slots}`;
+}
 
 function refreshRenderStats() {
   const s = view.stats();
@@ -297,7 +363,7 @@ function refresh() {
   shootButton.hidden = phase === "holed" || phase === "finished";
   shootButton.disabled = phase !== "aiming";
   nextButton.hidden = phase !== "holed";
-  status.textContent = phase === "rolling" ? "rolling…" : message;
+  status.textContent = requesting ? "encrypting, simulating, decrypting…" : phase === "rolling" ? "rolling…" : message;
   refreshPower();
   refreshScorecard();
 
@@ -321,11 +387,12 @@ function refresh() {
   stat("maxContacts").textContent = String(PHYSICS.maxContacts);
   stat("tests").textContent = (steps * faces).toLocaleString("en");
 
+  refreshLastShot();
   if (lastShot) {
     const { aim, shot, pb } = lastShot;
     stat("shotAim").textContent = `${fmt((aim.angle * 180) / Math.PI, 1)}° / ${Math.round(aim.power * 100)}%`;
-    stat("shotTimes").textContent = `${formatMs(lastShot.simulateMs)} / ${formatMs(lastShot.playbackMs)}`;
-    stat("shotContacts").textContent = `${shot.contacts.length} / ${shot.exhausted}`;
+    stat("shotPlayback").textContent = formatMs(lastShot.playbackMs);
+    stat("shotContacts").textContent = `${shot.segments.length - 1} / ${shot.exhausted}`;
     stat("shotDuration").textContent = `${fmt(pb.samples[pb.samples.length - 1].t, 2)} s / ${pb.samples.length}`;
     stat("shotOutcome").textContent = pb.outcome;
     stat("segments").textContent = shot.segments

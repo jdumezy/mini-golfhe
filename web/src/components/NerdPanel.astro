@@ -55,7 +55,7 @@ const block = "mt-1 break-all rounded bg-zinc-100 px-2 py-1.5 leading-relaxed da
     <section class={section}>
       <h2 class={heading}>last shot</h2>
       <div class={row}><span class={label}>angle / power</span><span data-stat="shotAim">–</span></div>
-      <div class={row}><span class={label}>simulate / playback</span><span data-stat="shotTimes">–</span></div>
+      <div class={row}><span class={label}>playback</span><span data-stat="shotPlayback">–</span></div>
       <div class={row}><span class={label}>contacts / exhausted</span><span data-stat="shotContacts">–</span></div>
       <div class={row}><span class={label}>duration / samples</span><span data-stat="shotDuration">–</span></div>
       <div class={row}><span class={label}>outcome</span><span data-stat="shotOutcome">–</span></div>
@@ -65,12 +65,19 @@ const block = "mt-1 break-all rounded bg-zinc-100 px-2 py-1.5 leading-relaxed da
 
     <section class={section}>
       <h2 class={heading}>fhe</h2>
-      <div class={row}><span class={label}>library</span><span>poulpy</span></div>
-      <div class={row}><span class={label}>client</span><span class="text-zinc-400">not connected</span></div>
-      <div class={row}><span class={label}>server</span><span class="text-zinc-400">not connected</span></div>
-      <div class={row}><span class={label}>keys</span><span class="text-zinc-400">–</span></div>
-      <div class={row}><span class={label}>ciphertexts</span><span class="text-zinc-400">–</span></div>
-      <div class={row}><span class={label}>encrypt / simulate / decrypt</span><span class="text-zinc-400">–</span></div>
+      <div class={row}><span class={label}>scheme</span><span data-stat="fheScheme">–</span></div>
+      <div class={row}><span class={label}>client</span><span data-stat="fheClient">–</span></div>
+      <div class={row}><span class={label}>server</span><span data-stat="fheServer">–</span></div>
+      <div class={row}><span class={label}>simulation</span><span data-stat="fheSimulation">–</span></div>
+      <div class={row}><span class={label}>evaluation key</span><span data-stat="fheKey">–</span></div>
+      <div class={`${label} mt-2`}>last shot</div>
+      <div class={row}><span class={label}>shot / trajectory ciphertexts</span><span data-stat="fheCiphertexts">–</span></div>
+      <div class={row}><span class={label}>sent / received</span><span data-stat="fheTraffic">–</span></div>
+      <div class={row}><span class={label}>encrypt</span><span data-stat="fheEncrypt">–</span></div>
+      <div class={row}><span class={label}>simulate (server)</span><span data-stat="fheSimulate">–</span></div>
+      <div class={row}><span class={label}>decrypt</span><span data-stat="fheDecrypt">–</span></div>
+      <div class={row}><span class={label}>transport / total</span><span data-stat="fheTotal">–</span></div>
+      <div class={row}><span class={label}>contacts used / slots</span><span data-stat="fheContacts">–</span></div>
     </section>
   </div>
 </aside>

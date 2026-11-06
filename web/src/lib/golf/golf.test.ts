@@ -4,12 +4,12 @@ import {
   gradient,
   HOLES,
   PHYSICS,
+  type Hole,
   type HoleSpec,
-  type ObstacleSpec,
   type TerrainSpec,
   type Vec2,
 } from "./course";
-import { advance, computeFlow, simulate, shotState, type State } from "./simulate";
+import { advance, computeFlow, flowOf, shotState, type Shot, type State } from "./flow";
 import { playback } from "./playback";
 
 const box = (w: number, h: number): Vec2[] => [
@@ -19,8 +19,30 @@ const box = (w: number, h: number): Vec2[] => [
   [0, h],
 ];
 
-function hole(extra: Partial<HoleSpec> = {}): ReturnType<typeof compileHole> {
+function hole(extra: Partial<HoleSpec> = {}): Hole {
   return compileHole({ name: "test", par: 2, tee: [1, 1], cup: [9, 9], boundary: box(10, 10), ...extra }, 0);
+}
+
+/** A shot that touches nothing before it stops (contacts are the server's job, see fhe/physics). */
+const free = (state: State): Shot => ({ segments: [{ t: 0, state }], exhausted: false });
+
+/** A shot with one bounce off the right rail of the 10 m box, as the server computes it. */
+function offRightRail(h: Hole, s0: State): Shot {
+  const flow = flowOf(h);
+  const e = PHYSICS.restitution.rail;
+  for (let k = 1; k <= flow.steps; k++) {
+    const [x, y, vx, vy] = advance(flow, k, s0);
+    const depth = 10 - PHYSICS.ballRadius - x;
+    if (depth < 0 && vx > 0)
+      return {
+        segments: [
+          { t: 0, state: s0 },
+          { t: k * flow.dt, state: [x + (1 + e) * depth, y, -e * vx, vy] },
+        ],
+        exhausted: false,
+      };
+  }
+  throw new Error("no contact");
 }
 
 /** Classic RK4 on the same ODE, for comparison. */
@@ -62,78 +84,22 @@ describe("flow", () => {
   });
 });
 
-describe("contacts", () => {
-  it("bounces off a rail, keeping the tangential velocity", () => {
-    const h = hole();
-    const shot = simulate(h, [5, 5, 4, 1]);
-    expect(shot.contacts[0]).toEqual([0]);
-    const [x, , vx, vy] = shot.segments[1].state;
-    expect(vx).toBeLessThan(0);
-    expect(x).toBeLessThan(10 - PHYSICS.ballRadius);
-    // e·|vn| out, tangential velocity unchanged by the bounce.
-    const before = advance(computeFlow(h.terrain), Math.round(shot.segments[1].t / PHYSICS.dt), [5, 5, 4, 1]);
-    expect(vx).toBeCloseTo(-PHYSICS.restitution.rail * before[2], 9);
-    expect(vy).toBeCloseTo(before[3], 9);
-  });
-
-  it("bounces straight back off a bumper hit head-on", () => {
-    const bumper: ObstacleSpec = { kind: "bumper", center: [5, 5], radius: 0.1 };
-    const shot = simulate(hole({ obstacles: [bumper] }), [2, 5, 3, 0]);
-    expect(shot.contacts[0]).toEqual([1]);
-    const [x, y, vx, vy] = shot.segments[1].state;
-    expect(vx).toBeLessThan(0);
-    expect(Math.abs(vy)).toBeLessThan(1e-9);
-    expect(5 - x).toBeGreaterThan(0.1 + PHYSICS.ballRadius - 1e-3);
-    expect(y).toBeCloseTo(5, 9);
-  });
-
-  it("bounces off the face of a block it comes through", () => {
-    const block: ObstacleSpec = {
-      kind: "block",
-      points: [
-        [4, 4],
-        [6, 4],
-        [6, 6],
-        [4, 6],
-      ],
-    };
-    // Coming down onto the top face.
-    const shot = simulate(hole({ obstacles: [block] }), [5.2, 8, 0.3, -2.5]);
-    expect(shot.contacts[0]).toEqual([1]);
-    const [, y, vx, vy] = shot.segments[1].state;
-    expect(vy).toBeGreaterThan(0);
-    expect(vx).toBeGreaterThan(0);
-    expect(y).toBeGreaterThan(6 + PHYSICS.ballRadius - 1e-3);
-  });
-
-  it("spends at most maxContacts contacts", () => {
-    // A fast ball bouncing between close rails.
-    const h = compileHole({ name: "t", par: 2, tee: [0.15, 0.5], cup: [0.15, 9], boundary: box(0.3, 10) }, 0);
-    const shot = simulate(h, [0.15, 0.5, 6, 0.1]);
-    expect(shot.exhausted).toBe(true);
-    expect(shot.segments).toHaveLength(PHYSICS.maxContacts + 1);
-  });
-});
-
 describe("playback", () => {
-  const putt = (h: ReturnType<typeof compileHole>, v: number) => playback(h, simulate(h, [1, 1, v, v]));
-
   it("holes a well-paced putt", () => {
     const h = hole({ cup: [3, 3] });
     // Reach the cup at about 0.5 m/s: v0 = 0.5 + λ·d.
-    const p = putt(h, (0.5 + PHYSICS.drag * Math.hypot(2, 2)) / Math.SQRT2);
+    const v = (0.5 + PHYSICS.drag * Math.hypot(2, 2)) / Math.SQRT2;
+    const p = playback(h, free([1, 1, v, v]));
     expect(p.outcome).toBe("cup");
     expect(p.final).toEqual([3, 3]);
   });
 
   it("lets a fast ball run over the cup", () => {
-    const p = putt(hole({ cup: [3, 3] }), 4);
-    expect(p.outcome).not.toBe("cup");
+    expect(playback(hole({ cup: [3, 3] }), free([1, 1, 4, 4])).outcome).not.toBe("cup");
   });
 
   it("comes to rest on flat ground after the expected distance", () => {
-    const h = hole();
-    const p = playback(h, simulate(h, [1, 5, 2, 0]));
+    const p = playback(hole(), free([1, 5, 2, 0]));
     expect(p.outcome).toBe("rest");
     expect(p.final[0] - 1).toBeCloseTo((2 - PHYSICS.stopSpeed) / PHYSICS.drag, 1);
   });
@@ -145,21 +111,38 @@ describe("playback", () => {
       [5, 1.5],
       [4, 1.5],
     ];
-    const h = hole({ water: [pond] });
-    expect(playback(h, simulate(h, [1, 1, 4, 0])).outcome).toBe("water");
+    expect(playback(hole({ water: [pond] }), free([1, 1, 4, 0])).outcome).toBe("water");
   });
 
   it("settles at the bottom of a bowl", () => {
     const h = hole({ terrain: { center: [5, 5], hessian: [0.1, 0, 0.1], slope: [0, 0] } });
-    const p = playback(h, simulate(h, [5, 5, 3, 0.5]));
+    const p = playback(h, free([5, 5, 3, 0.5]));
     expect(p.outcome).toBe("rest");
     expect(Math.hypot(p.final[0] - 5, p.final[1] - 5)).toBeLessThan(0.3);
   });
 
-  it("keeps samples in time order", () => {
-    const h = hole({ obstacles: [{ kind: "bumper", center: [5, 5], radius: 0.3 }] });
-    const p = playback(h, simulate(h, [1, 1, 4, 3.6]));
+  it("shows the ball touching the rail, in time order", () => {
+    const h = hole();
+    const p = playback(h, offRightRail(h, [5, 5, 5, 1]));
+    const touch = p.samples.find((s) => s.contact);
+    expect(touch?.x).toBeCloseTo(10 - PHYSICS.ballRadius, 3);
     for (let i = 1; i < p.samples.length; i++) expect(p.samples[i].t).toBeGreaterThanOrEqual(p.samples[i - 1].t);
+    expect(p.final[0]).toBeLessThan(10);
+  });
+
+  it("rests against a rail it reaches slowly", () => {
+    const h = hole();
+    // About 0.1 m/s at the rail, bouncing back under wallRestSpeed.
+    const p = playback(h, offRightRail(h, [6, 5, 0.1 + PHYSICS.drag * (4 - PHYSICS.ballRadius), 0]));
+    expect(p.outcome).toBe("rest");
+    expect(p.final[0]).toBeCloseTo(10 - PHYSICS.ballRadius, 3);
+  });
+
+  it("stops before the next obstacle once the contacts are spent", () => {
+    const p = playback(hole(), { segments: [{ t: 0, state: [5, 5, 5, 0] }], exhausted: true });
+    expect(p.outcome).toBe("rest");
+    expect(p.final[0]).toBeLessThan(10 - PHYSICS.ballRadius);
+    expect(p.final[0]).toBeGreaterThan(9.9);
   });
 });
 

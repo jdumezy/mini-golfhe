@@ -12,7 +12,7 @@ import {
   type PhysicsSpec,
   type Vec2,
 } from "./course";
-import { advance, flowOf, type Shot, type State } from "./simulate";
+import { advance, flowOf, type Shot, type State } from "./flow";
 
 export interface Sample {
   t: number;
