@@ -79,6 +79,8 @@ impl Engine for Timed<'_> {
     type Ct = DeviceCiphertext;
     type Pt = crate::engine::Plaintext;
     type Poly = crate::engine::DevicePoly;
+    type Transform = crate::engine::DeviceTransform;
+    type Rotated = crate::engine::DeviceRotations;
     fn slots(&self) -> usize {
         self.inner.slots()
     }
@@ -121,6 +123,15 @@ impl Engine for Timed<'_> {
     fn eval_poly(&self, a: &Self::Ct, p: &Self::Poly) -> R<Self::Ct> {
         self.time("polynomial", || self.inner.eval_poly(a, p))
     }
+    fn encode_transform(&self, d: &[(i64, Vec<f64>)]) -> R<Self::Transform> {
+        self.inner.encode_transform(d)
+    }
+    fn rotations_of(&self, a: &Self::Ct, shifts: &[i64]) -> R<Self::Rotated> {
+        self.time("rotations", || self.inner.rotations_of(a, shifts))
+    }
+    fn transform(&self, a: &Self::Ct, r: &Self::Rotated, t: &Self::Transform) -> R<Self::Ct> {
+        self.time("transform", || self.inner.transform(a, r, t))
+    }
     fn refresh(&self, a: &Self::Ct) -> R<Self::Ct> {
         self.budgets.lock().unwrap().push(self.inner.log_budget(a));
         self.time("bootstrap", || self.inner.refresh(a))
@@ -138,9 +149,16 @@ fn max_err(a: &[f64], b: &[f64]) -> f64 {
 
 /// Runs `plan` under CKKS and compares each contact with the simulator.
 fn compare(engine: &CkksEngine, sk: &crate::SecretKey, plan: &Plan, shot: &State) {
+    let start = engine.upload(&engine.ring.encrypt(sk, &encode_state(shot), [3; 32]).unwrap());
+    // Without waiting for the device after every operation, as the server runs.
+    let plain = Prepared::new(engine, plan).unwrap();
+    let t = Instant::now();
+    evaluate(engine, &plain, &start, |_| {}).unwrap();
+    engine.synchronize();
+    eprintln!("evaluation in {:.2?}", t.elapsed());
+    drop(plain);
     let timed = Timed::new(engine);
     let prepared = Prepared::new(&timed, plan).unwrap();
-    let start = engine.upload(&engine.ring.encrypt(sk, &encode_state(shot), [3; 32]).unwrap());
     let fresh = engine.log_budget(&start);
     let t = Instant::now();
     let outputs = evaluate(&timed, &prepared, &start, |_| {}).unwrap();
@@ -256,6 +274,8 @@ impl Engine for Shadow<'_> {
     type Ct = (DeviceCiphertext, Vec<f64>);
     type Pt = (crate::engine::Plaintext, Vec<f64>);
     type Poly = (crate::engine::DevicePoly, Poly);
+    type Transform = (crate::engine::DeviceTransform, Vec<(i64, Vec<f64>)>);
+    type Rotated = (crate::engine::DeviceRotations, BTreeMap<i64, Vec<f64>>);
     fn slots(&self) -> usize {
         SLOTS
     }
@@ -301,6 +321,15 @@ impl Engine for Shadow<'_> {
     }
     fn eval_poly(&self, a: &Self::Ct, p: &Self::Poly) -> R<Self::Ct> {
         Ok(self.check("polynomial", (self.engine.eval_poly(&a.0, &p.0)?, self.sim.eval_poly(&a.1, &p.1)?)))
+    }
+    fn encode_transform(&self, d: &[(i64, Vec<f64>)]) -> R<Self::Transform> {
+        Ok((self.engine.encode_transform(d)?, d.to_vec()))
+    }
+    fn rotations_of(&self, a: &Self::Ct, shifts: &[i64]) -> R<Self::Rotated> {
+        Ok((self.engine.rotations_of(&a.0, shifts)?, self.sim.rotations_of(&a.1, shifts)?))
+    }
+    fn transform(&self, a: &Self::Ct, r: &Self::Rotated, t: &Self::Transform) -> R<Self::Ct> {
+        Ok(self.check("transform", (self.engine.transform(&a.0, &r.0, &t.0)?, self.sim.transform(&a.1, &r.1, &t.1)?)))
     }
     fn refresh(&self, a: &Self::Ct) -> R<Self::Ct> {
         Ok(self.check("refresh", (self.engine.refresh(&a.0)?, a.1.clone())))

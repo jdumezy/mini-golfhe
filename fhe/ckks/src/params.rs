@@ -20,6 +20,11 @@ const BOOTSTRAP_FAILURE_BITS: usize = 128;
 /// deeper half takes about 16 levels of 35 bits and four plaintext masks.
 pub const USABLE_BITS: usize = 700;
 
+/// CoeffsToSlots as `(layers, giant step)` factors, the first applied by the
+/// modulus raise: four small factors instead of the preset's three of five
+/// layers, about a third faster on a GPU (measured on Metal), with smaller keys.
+const FIRST_FACTOR_ON_RAISE: [(usize, usize); 4] = [(3, 1), (4, 1024), (4, 64), (4, 4)];
+
 #[derive(Clone, Debug)]
 pub struct Params {
     pub name: String,
@@ -67,13 +72,16 @@ fn for_backend(preset: BootstrappingPreset) -> Result<BootstrappingPreset> {
 
 impl Params {
     /// 128-bit secure parameters: logN 16, refreshed by the bootstrap of the
-    /// `n16_d35_k733_p20_s2c` preset widened to [`USABLE_BITS`].
+    /// `n16_d35_k733_p20_s2c` preset with the first CoeffsToSlots factor on the
+    /// raise ([`FIRST_FACTOR_ON_RAISE`]), widened to [`USABLE_BITS`].
     pub fn secure() -> Result<Params> {
         // Power-of-two rotation keys: fewer bootstrapping keys, faster on a GPU.
-        let base = for_backend(n16_d35_k733_p20_s2c()?.with_power_of_two_keys()?)?;
+        let base =
+            n16_d35_k733_p20_s2c()?.with_power_of_two_keys()?.with_first_factor_on_raise(&FIRST_FACTOR_ON_RAISE)?;
+        let base = for_backend(base)?;
         let preset = Preset::new(&base, USABLE_BITS).context("widening the bootstrap")?;
         Ok(Params {
-            name: format!("{} (power-of-two keys)", preset.name),
+            name: format!("{} (power-of-two keys, first factor on the raise)", preset.name),
             log_n: preset.log_n,
             base2k: preset.base2k,
             log_delta: preset.log_delta,

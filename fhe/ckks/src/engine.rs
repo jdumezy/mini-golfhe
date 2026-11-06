@@ -16,12 +16,19 @@ use poulpy_ckks::api::{
     CKKSAllOpsTmpBytes, CKKSBootstrappingOps, CKKSCopyOps, CKKSEncodingHostOps, CKKSInnerSumOps,
     CKKSPolynomialEvaluationOps, CKKSPow2Ops,
 };
+use poulpy_ckks::api::{
+    CKKSLinearTransformationOps, LinearTransformationBabySteps, LinearTransformationPlan, LinearTransformationPrepared,
+    LinearTransformationStrategy, ckks_plaintext_diagonal_layout,
+};
+use poulpy_ckks::encoding::ckks_linear_transformation_encode_from_diagonals;
+use poulpy_ckks::layouts::ComplexDiagonals;
 use poulpy_ckks::layouts::{
     BootstrappingContextPrepared, BootstrappingKeySet, BootstrappingKeysLayout, BootstrappingKeysPrepared,
     CKKSCiphertextOwned, CKKSPlaintextOwned, EncapsulationKeys,
 };
 use poulpy_ckks::polynomial::{BSGSPolynomial, Basis, CKKSPolynomialEncode, Polynomial, SplitStrategy};
 use poulpy_ckks::prelude::*;
+use poulpy_core::layouts::Diagonals;
 use poulpy_core::layouts::prepared::{GLWEAutomorphismKeyPrepared, GLWESwitchingKeyPrepared, GLWETensorKeyPrepared};
 use poulpy_core::layouts::prepared::{GLWEAutomorphismKeyPreparedBackendRef, GLWETensorKeyPreparedBackendRef};
 use poulpy_core::layouts::{
@@ -57,6 +64,13 @@ pub struct DevicePoly {
     bsgs: BSGSPolynomial<CKKSPlaintextOwned<Dev>>,
     map: Option<(usize, Plaintext)>,
 }
+/// A linear transform's diagonals, prepared on the device, and its schedule.
+pub struct DeviceTransform {
+    prepared: LinearTransformationPrepared<Dev>,
+    plan: LinearTransformationPlan,
+}
+/// The rotations of a ciphertext, prepared for the products of transforms.
+pub struct DeviceRotations(LinearTransformationBabySteps<Dev>);
 type Word = <Be as Backend>::ZnxWord;
 type Buf = <Be as Backend>::OwnedBuf;
 type DevBuf = <Dev as Backend>::OwnedBuf;
@@ -94,6 +108,12 @@ fn bootstrap_keygen_tmp_bytes(module: &Module<Be>, layout: &BootstrappingKeysLay
     let mut bytes = module.glwe_tensor_key_encrypt_sk_tmp_bytes(&layout.tensor_key);
     for key in layout.rotation_key_layouts() {
         bytes = bytes.max(module.glwe_automorphism_key_encrypt_sk_tmp_bytes(&key));
+    }
+    // A first-factor key is encrypted beside the sparse secret and its rotation, both carved from the scratch.
+    if let Some(key) = &layout.first_factor_key {
+        let (n, rank) = (key.n().as_usize(), key.rank_out().as_usize());
+        let secret = Be::scratch_aligned(Be::scalar_znx_bytes_of(n, rank));
+        bytes = bytes.max(2 * secret + module.glwe_switching_key_encrypt_sk_tmp_bytes(key));
     }
     if let Some(e) = &layout.encapsulation {
         for key in [Some(e.dense_to_sparse), e.sparse_to_dense].into_iter().flatten() {
@@ -299,6 +319,15 @@ impl CkksEngine {
         self.keys.is_some()
     }
 
+    /// Runs `f` on the scratch arena, grown to `bytes` first if it is smaller.
+    fn with_scratch<T>(&self, bytes: usize, f: impl FnOnce(&mut ScratchArena<'_, Dev>) -> Result<T>) -> Result<T> {
+        let mut scratch = self.scratch.lock().unwrap();
+        if scratch.0 < bytes {
+            *scratch = (bytes, ScratchOwned::<Dev>::alloc(bytes));
+        }
+        f(&mut scratch.1.borrow())
+    }
+
     /// Bytes of the scratch arena.
     pub fn scratch_size(&self) -> usize {
         self.scratch.lock().unwrap().0
@@ -390,6 +419,8 @@ impl Engine for CkksEngine {
     type Ct = DeviceCiphertext;
     type Pt = Plaintext;
     type Poly = DevicePoly;
+    type Transform = DeviceTransform;
+    type Rotated = DeviceRotations;
 
     fn slots(&self) -> usize {
         self.ring.params.slots()
@@ -530,6 +561,82 @@ impl Engine for CkksEngine {
             &self.keys()?.tensor_key,
             &mut scratch.borrow(),
         )?;
+        Ok(out)
+    }
+
+    /// All diagonals in one giant step: the products read the rotations of the
+    /// source, and their sum needs no rotation of its own.
+    fn encode_transform(&self, diagonals: &[(i64, Vec<f64>)]) -> Result<DeviceTransform> {
+        let p = &self.ring.params;
+        let slots = p.slots();
+        let (mut re, mut im) = (Diagonals::<f64>::new(slots), Diagonals::<f64>::new(slots));
+        for (k, d) in diagonals {
+            re.set(k.rem_euclid(slots as i64), d.clone());
+            im.set(k.rem_euclid(slots as i64), vec![0.0; slots]);
+        }
+        let lt = {
+            let scratch = &mut self.scratch.lock().unwrap().1;
+            ckks_linear_transformation_encode_from_diagonals(
+                &self.module,
+                p.base2k.into(),
+                CoeffsMeta::from_delta_budget(p.pt_log_delta, PT_INTEGER_BITS),
+                &ComplexDiagonals::new(re, im),
+                LinearTransformationStrategy::Bsgs { giant_step: slots },
+                false,
+                &mut scratch.borrow(),
+            )?
+        };
+        let first = lt.first_diagonal_plaintext().context("a transform without diagonals")?;
+        let plan = lt.index();
+        let mut prepared = LinearTransformationPrepared::<Dev>::alloc_prepared_from_index(&self.module, &plan, first);
+        let bytes = self.module.ckks_linear_transformation_rhs_prepare_tmp_bytes(first);
+        self.with_scratch(bytes, |s| Ok(self.module.ckks_linear_transformation_rhs_prepare(&mut prepared, &lt, s)?))?;
+        Ok(DeviceTransform { prepared, plan })
+    }
+
+    fn rotations_of(&self, a: &DeviceCiphertext, shifts: &[i64]) -> Result<DeviceRotations> {
+        let slots = self.ring.params.slots() as i64;
+        let mut steps: Vec<i64> = shifts.iter().map(|k| k.rem_euclid(slots)).chain([0]).collect();
+        steps.sort_unstable();
+        steps.dedup();
+        let plan = LinearTransformationPlan {
+            baby_steps: steps.clone(),
+            giant_steps: vec![0],
+            index: vec![steps.clone()],
+            rotations: Default::default(),
+        };
+        let mut babies = LinearTransformationBabySteps::alloc(&self.module, &steps, a);
+        let bytes = self.module.ckks_linear_transformation_baby_steps_prepare_tmp_bytes(
+            a,
+            &plan,
+            &self.ring.params.rotation_key_layout(),
+        );
+        self.with_scratch(bytes, |s| {
+            Ok(self.module.ckks_linear_transformation_baby_steps_prepare(&mut babies, a, &self.rotations()?, s)?)
+        })?;
+        Ok(DeviceRotations(babies))
+    }
+
+    fn transform(&self, a: &DeviceCiphertext, r: &DeviceRotations, t: &DeviceTransform) -> Result<DeviceCiphertext> {
+        let p = &self.ring.params;
+        let mut out = self.alloc_like(a.k().as_usize());
+        let bytes = self.module.ckks_linear_transformation_eval_tmp_bytes(
+            a,
+            &ckks_plaintext_diagonal_layout(a),
+            &t.plan,
+            &p.tensor_key_layout(),
+            &p.rotation_key_layout(),
+        );
+        self.with_scratch(bytes, |s| {
+            Ok(self.module.ckks_linear_transformation_eval_into(
+                &mut out,
+                a,
+                &r.0,
+                &t.prepared,
+                &self.rotations()?,
+                s,
+            )?)
+        })?;
         Ok(out)
     }
 

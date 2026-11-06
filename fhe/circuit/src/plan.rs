@@ -61,6 +61,32 @@ impl Affine {
     }
 }
 
+/// `value[slot] = Σ_c coef[c][slot] · X_c[slot] + offset[slot]`, with `X` the
+/// state at the slot's step (see [`Plan::state`]): unused components are `None`.
+#[derive(Clone, Debug)]
+pub struct Linear {
+    pub coef: [Option<Vec<f64>>; 4],
+    pub offset: Vec<f64>,
+}
+
+impl Linear {
+    fn new(components: &[usize], offset: f64) -> Linear {
+        Linear {
+            coef: std::array::from_fn(|c| components.contains(&c).then(|| vec![0.0; SLOTS])),
+            offset: vec![offset; SLOTS],
+        }
+    }
+
+    fn set(&mut self, slot: usize, coef: [f64; 4], offset: f64) {
+        for (c, v) in self.coef.iter_mut().enumerate() {
+            if let Some(v) = v {
+                v[slot] = coef[c];
+            }
+        }
+        self.offset[slot] = offset;
+    }
+}
+
 pub fn slot(k: usize, f: usize) -> usize {
     k * FACES + f
 }
@@ -72,13 +98,14 @@ pub struct Plan {
     pub dt: f64,
     /// Gaps closer to zero than this, in metres, may be misjudged (the worst slot).
     pub band: f64,
-    /// Normalized gap of every grid slot (and of step 0 in window 1): the
-    /// ball's clearance at step `k` to face `f`.
-    pub gap: Affine,
-    /// The state at step `k`, in every slot of the step.
+    /// The state at step `k`, in every slot of the step (window 1, and the
+    /// last steps of window 3: at step 0).
     pub state: [Affine; 4],
+    /// Normalized gap of every grid slot (and of step 0 in window 1): the
+    /// ball's clearance at step `k` to face `f`, from the state at the step.
+    pub gap: Linear,
     /// The bounce off face `f` at step `k`, for the state components.
-    pub delta: [Affine; 4],
+    pub delta: [Linear; 4],
     /// Composite sign, its last factor turned into `(1 − sign)/2`: 1 behind a face.
     pub inside: Vec<Poly>,
     /// Slots of rail faces (each a detector), every step, windows 0 and 1.
@@ -121,17 +148,31 @@ impl Plan {
             positions.max(c.abs()) + physics.max_speed * a[2].hypot(a[3])
         };
 
-        let mut gap = Affine::zero();
-        gap.offset.fill(PADDING_GAP);
         let mut state: [Affine; 4] = std::array::from_fn(|_| Affine::zero());
-        let mut delta: [Affine; 4] = std::array::from_fn(|_| Affine::zero());
+        let mut gap = Linear::new(&[0, 1], PADDING_GAP);
+        let mut delta = [
+            Linear::new(&[0, 1], 0.0),
+            Linear::new(&[0, 1], 0.0),
+            Linear::new(&[2, 3], 0.0),
+            Linear::new(&[2, 3], 0.0),
+        ];
         let mut band = 0.0f64;
-        let mut gaps_at_start = vec![([0.0; 4], 0.0); FACES];
+        // Window 1 holds every step at step 0, and so do the last steps of
+        // window 3, which the first steps of the grid read when they look back
+        // FACE_LAG steps (rotations wrap around the ring).
         for (k, maps) in m.iter().enumerate().take(STEPS) {
             let row = |r: usize| -> [f64; 4] { std::array::from_fn(|j| maps[r][j]) };
             for f in 0..FACES {
                 for (r, a) in state.iter_mut().enumerate() {
                     a.set(slot(k, f), row(r), maps[r][4]);
+                    if k == 0 {
+                        for k2 in 0..STEPS {
+                            a.set(WINDOW + slot(k2, f), row(r), maps[r][4]);
+                        }
+                        for k2 in STEPS - FACE_LAG..STEPS {
+                            a.set(3 * WINDOW + slot(k2, f), row(r), maps[r][4]);
+                        }
+                    }
                 }
             }
             for d in &hole.detectors {
@@ -140,40 +181,25 @@ impl Plan {
                     let f = d.first + i;
                     let s = slot(k, f);
                     let [nx, ny] = face.n;
-                    // Clearance and normal speed, affine in the state.
-                    let along = |a: usize, b: usize| -> ([f64; 4], f64) {
-                        (std::array::from_fn(|j| nx * maps[a][j] + ny * maps[b][j]), nx * maps[a][4] + ny * maps[b][4])
-                    };
-                    let ((g, g0), (v, v0)) = (along(0, 1), along(2, 3));
-                    let g0 = g0 - face.b;
-                    let scaled = |a: [f64; 4], c: f64, x: f64| (a.map(|v| e * x * v), e * x * c);
-                    for (r, (a, c)) in [scaled(g, g0, nx), scaled(g, g0, ny), scaled(v, v0, nx), scaled(v, v0, ny)]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        delta[r].set(s, a, c);
-                    }
-                    // Each slot's gap, divided by its own bound, lies in [−1, 1]:
-                    // the comparison resolves a fraction of that bound.
-                    let norm = bound(g, g0) * NORM_MARGIN;
-                    gap.set(s, g.map(|v| v / norm), g0 / norm);
+                    // Clearance n·q − b and normal speed n·v from the state at the
+                    // step; mirror the first and reflect the second, scaled by 1 + e.
+                    delta[0].set(s, [e * nx * nx, e * nx * ny, 0.0, 0.0], -e * nx * face.b);
+                    delta[1].set(s, [e * ny * nx, e * ny * ny, 0.0, 0.0], -e * ny * face.b);
+                    delta[2].set(s, [0.0, 0.0, e * nx * nx, e * nx * ny], 0.0);
+                    delta[3].set(s, [0.0, 0.0, e * ny * nx, e * ny * ny], 0.0);
+                    // Each slot's gap, divided by a bound on its magnitude over
+                    // the shots, lies in [−1, 1]: the comparison resolves a fraction of it.
+                    let g: [f64; 4] = std::array::from_fn(|j| nx * maps[0][j] + ny * maps[1][j]);
+                    let norm = bound(g, nx * maps[0][4] + ny * maps[1][4] - face.b) * NORM_MARGIN;
                     band = band.max(norm * 2f64.powf(-poly::SIGN_LOG_TAU));
+                    let mut slots = vec![s];
                     if k == 0 {
-                        gaps_at_start[f] = (g.map(|v| v / norm), g0 / norm);
+                        slots.extend((0..STEPS).map(|k2| WINDOW + slot(k2, f)));
+                        slots.extend((STEPS - FACE_LAG..STEPS).map(|k2| 3 * WINDOW + slot(k2, f)));
                     }
-                }
-            }
-        }
-        // Window 1: every step's slot holds the gap at step 0. So do the last
-        // steps of window 3, which the first steps of the grid read when they
-        // look back FACE_LAG steps (rotations wrap around the ring).
-        for d in &hole.detectors {
-            for (f, &(a, c)) in gaps_at_start.iter().enumerate().skip(d.first).take(d.count) {
-                for k in 0..STEPS {
-                    gap.set(WINDOW + slot(k, f), a, c);
-                }
-                for k in STEPS - FACE_LAG..STEPS {
-                    gap.set(3 * WINDOW + slot(k, f), a, c);
+                    for x in slots {
+                        gap.set(x, [nx / norm, ny / norm, 0.0, 0.0], -face.b / norm);
+                    }
                 }
             }
         }

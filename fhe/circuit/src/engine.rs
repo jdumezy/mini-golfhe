@@ -3,7 +3,7 @@
 //! The evaluator only talks to an [`Engine`], so the CKKS evaluation and the
 //! plaintext simulation run the very same sequence of operations.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::poly::Poly;
 
@@ -11,6 +11,10 @@ pub trait Engine: Sync {
     type Ct: Send + Sync;
     type Pt: Send + Sync;
     type Poly: Send + Sync;
+    /// A linear transform with plaintext diagonals (see [`Engine::encode_transform`]).
+    type Transform: Send + Sync;
+    /// The rotations of a ciphertext that transforms read (see [`Engine::rotations_of`]).
+    type Rotated;
 
     fn slots(&self) -> usize;
 
@@ -34,6 +38,14 @@ pub trait Engine: Sync {
     fn replicate(&self, a: &Self::Ct, log_batch: usize, log_count: usize) -> Result<Self::Ct>;
     fn eval_poly(&self, a: &Self::Ct, poly: &Self::Poly) -> Result<Self::Ct>;
 
+    /// `a ↦ Σ_(k, d) d ⊙ rot(a, k)` over `diagonals`, which must not repeat a shift.
+    fn encode_transform(&self, diagonals: &[(i64, Vec<f64>)]) -> Result<Self::Transform>;
+    /// The rotations of `a` by `shifts` (and by 0), for the transforms of `a`
+    /// whose shifts they cover: rotated once, read by each.
+    fn rotations_of(&self, a: &Self::Ct, shifts: &[i64]) -> Result<Self::Rotated>;
+    /// The transform `t` of `a`, from its rotations `r`.
+    fn transform(&self, a: &Self::Ct, r: &Self::Rotated, t: &Self::Transform) -> Result<Self::Ct>;
+
     /// Bootstraps `a`: same values, capacity restored.
     fn refresh(&self, a: &Self::Ct) -> Result<Self::Ct>;
 }
@@ -52,6 +64,8 @@ impl Engine for SlotSim {
     type Ct = Vec<f64>;
     type Pt = Vec<f64>;
     type Poly = Poly;
+    type Transform = Vec<(i64, Vec<f64>)>;
+    type Rotated = std::collections::BTreeMap<i64, Vec<f64>>;
 
     fn slots(&self) -> usize {
         self.slots
@@ -123,6 +137,24 @@ impl Engine for SlotSim {
         Ok(a.iter().map(|&x| poly.eval(x)).collect())
     }
 
+    fn encode_transform(&self, diagonals: &[(i64, Vec<f64>)]) -> Result<Self::Transform> {
+        Ok(diagonals.to_vec())
+    }
+
+    fn rotations_of(&self, a: &Vec<f64>, shifts: &[i64]) -> Result<Self::Rotated> {
+        let n = self.slots as i64;
+        Ok(shifts.iter().chain([&0]).map(|&k| (k.rem_euclid(n), rotate(a, k))).collect())
+    }
+
+    fn transform(&self, _: &Vec<f64>, r: &Self::Rotated, t: &Self::Transform) -> Result<Vec<f64>> {
+        let mut out = vec![0.0; self.slots];
+        for (k, d) in t {
+            let rotated = r.get(&k.rem_euclid(self.slots as i64)).context("a shift the rotations miss")?;
+            out.iter_mut().zip(rotated.iter().zip(d)).for_each(|(o, (x, y))| *o += x * y);
+        }
+        Ok(out)
+    }
+
     fn refresh(&self, a: &Vec<f64>) -> Result<Vec<f64>> {
         Ok(a.clone())
     }
@@ -147,6 +179,8 @@ impl Engine for Recorder {
     type Ct = ();
     type Pt = ();
     type Poly = ();
+    type Transform = ();
+    type Rotated = ();
 
     fn slots(&self) -> usize {
         self.slots
@@ -191,6 +225,18 @@ impl Engine for Recorder {
         Ok(())
     }
     fn eval_poly(&self, _: &(), _: &()) -> Result<()> {
+        Ok(())
+    }
+    fn encode_transform(&self, _: &[(i64, Vec<f64>)]) -> Result<()> {
+        Ok(())
+    }
+    fn rotations_of(&self, _: &(), shifts: &[i64]) -> Result<()> {
+        let n = self.slots as i64;
+        let mut seen = self.seen.lock().unwrap();
+        seen.shifts.extend(shifts.iter().map(|k| k.rem_euclid(n)).filter(|&k| k != 0));
+        Ok(())
+    }
+    fn transform(&self, _: &(), _: &(), _: &()) -> Result<()> {
         Ok(())
     }
     fn refresh(&self, _: &()) -> Result<()> {

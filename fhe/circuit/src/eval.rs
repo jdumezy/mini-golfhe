@@ -20,23 +20,26 @@ use anyhow::Result;
 use crate::engine::Engine;
 use mini_golfhe_physics::FACE_LAG;
 
-use crate::plan::{Affine, FACES, LOG_FACES, LOG_STEPS, LOG_WINDOW, Plan, WINDOW};
+use crate::plan::{Affine, FACES, LOG_FACES, LOG_STEPS, LOG_WINDOW, Linear, Plan, WINDOW};
 
+/// An [`Affine`] map: a transform of the state over its four windows, and the offset.
 struct PreparedAffine<E: Engine> {
-    coef: [E::Pt; 4],
+    transform: E::Transform,
     offset: E::Pt,
 }
 
 /// A [`Plan`] with every plaintext encoded for an engine.
 pub struct Prepared<E: Engine> {
     pub max_contacts: usize,
-    gap: PreparedAffine<E>,
     state: [PreparedAffine<E>; 4],
+    gap: PreparedAffine<E>,
     delta: [PreparedAffine<E>; 4],
     inside: Vec<E::Poly>,
     rails: E::Pt,
     blocks: Vec<(usize, E::Pt)>,
-    block_faces: Vec<E::Pt>,
+    /// Each block's gate, from its first face's slot to all of its faces.
+    spread: Option<E::Transform>,
+    spread_shifts: Vec<i64>,
     first_face: E::Pt,
     last_step: E::Pt,
     first_faces: E::Pt,
@@ -47,16 +50,25 @@ pub struct Prepared<E: Engine> {
     is_positive: E::Poly,
 }
 
+/// Shifts bringing each state window to window 0.
+const STATE_SHIFTS: [i64; 4] = [0, WINDOW as i64, 2 * WINDOW as i64, 3 * WINDOW as i64];
+
 fn prepare_affine<E: Engine>(engine: &E, a: &Affine) -> Result<PreparedAffine<E>> {
-    Ok(PreparedAffine {
-        coef: [
-            engine.encode(&a.coef[0])?,
-            engine.encode(&a.coef[1])?,
-            engine.encode(&a.coef[2])?,
-            engine.encode(&a.coef[3])?,
-        ],
-        offset: engine.encode(&a.offset)?,
-    })
+    let diagonals: Vec<(i64, Vec<f64>)> = STATE_SHIFTS.iter().zip(&a.coef).map(|(&k, c)| (k, c.clone())).collect();
+    Ok(PreparedAffine { transform: engine.encode_transform(&diagonals)?, offset: engine.encode(&a.offset)? })
+}
+
+/// A linear map of the state at every step, as an affine map of the shot's state.
+fn compose(l: &Linear, state: &[Affine; 4]) -> Affine {
+    let mut out = Affine { coef: std::array::from_fn(|_| vec![0.0; l.offset.len()]), offset: l.offset.clone() };
+    for (c, a) in l.coef.iter().zip(state) {
+        let Some(c) = c else { continue };
+        for (o, coef) in out.coef.iter_mut().zip(&a.coef) {
+            o.iter_mut().zip(c.iter().zip(coef)).for_each(|(o, (c, x))| *o += c * x);
+        }
+        out.offset.iter_mut().zip(c.iter().zip(&a.offset)).for_each(|(o, (c, x))| *o += c * x);
+    }
+    out
 }
 
 impl<E: Engine> Prepared<E> {
@@ -71,13 +83,25 @@ impl<E: Engine> Prepared<E> {
         };
         Ok(Prepared {
             max_contacts: plan.max_contacts,
-            gap: prepare_affine(engine, &plan.gap)?,
             state: affines(&plan.state)?,
-            delta: affines(&plan.delta)?,
+            gap: prepare_affine(engine, &compose(&plan.gap, &plan.state))?,
+            delta: [
+                prepare_affine(engine, &compose(&plan.delta[0], &plan.state))?,
+                prepare_affine(engine, &compose(&plan.delta[1], &plan.state))?,
+                prepare_affine(engine, &compose(&plan.delta[2], &plan.state))?,
+                prepare_affine(engine, &compose(&plan.delta[3], &plan.state))?,
+            ],
             inside: plan.inside.iter().map(|p| engine.encode_poly(p)).collect::<Result<_>>()?,
             rails: engine.encode(&plan.rails)?,
             blocks: plan.blocks.iter().map(|(n, m)| Ok((*n, engine.encode(m)?))).collect::<Result<_>>()?,
-            block_faces: plan.block_faces.iter().map(|m| engine.encode(m)).collect::<Result<_>>()?,
+            spread: if plan.block_faces.is_empty() {
+                None
+            } else {
+                let diagonals: Vec<(i64, Vec<f64>)> =
+                    plan.block_faces.iter().enumerate().map(|(i, m)| (-(i as i64), m.clone())).collect();
+                Some(engine.encode_transform(&diagonals)?)
+            },
+            spread_shifts: (1..plan.block_faces.len() as i64).map(|i| -i).collect(),
             first_face: engine.encode(&plan.first_face)?,
             last_step: engine.encode(&plan.last_step)?,
             first_faces: engine.encode(&plan.first_faces)?,
@@ -134,15 +158,13 @@ fn contact<E: Engine>(
     let f = FACES as i64;
 
     // --- First half: gaps, indicators, and what the second half sums. ---
-    let components = [en.copy(state)?, en.rotate(state, w)?, en.rotate(state, 2 * w)?, en.rotate(state, 3 * w)?];
+    let windows = en.rotations_of(state, &STATE_SHIFTS[1..])?;
     let affine = |a: &PreparedAffine<E>| -> Result<E::Ct> {
-        let mut acc = en.mul_pt(&components[0], &a.coef[0])?;
-        for (component, coef) in components.iter().zip(&a.coef).skip(1) {
-            en.add_assign(&mut acc, &en.mul_pt(component, coef)?)?;
-        }
+        let mut acc = en.transform(state, &windows, &a.transform)?;
         en.add_pt_assign(&mut acc, &a.offset)?;
         Ok(acc)
     };
+    let at_step: Vec<E::Ct> = plan.state.iter().map(&affine).collect::<Result<_>>()?;
     let mut h = affine(&plan.gap)?;
     for p in &plan.inside {
         h = en.eval_poly(&h, p)?;
@@ -153,7 +175,6 @@ fn contact<E: Engine>(
     en.neg_assign(&mut three_minus)?;
     en.add_pt_assign(&mut three_minus, &plan.three)?;
     let c = en.mul(&en.mul(&h, &h)?, &three_minus)?;
-    let at_step: Vec<E::Ct> = plan.state.iter().map(&affine).collect::<Result<_>>()?;
     let bounce: Vec<E::Ct> = plan.delta.iter().map(&affine).collect::<Result<_>>()?;
     inspect(Event::Refresh { index, state: false });
     let c = en.refresh(&c)?;
@@ -195,12 +216,9 @@ fn contact<E: Engine>(
     // The faces bounced off: a rail's own; for a block, those it was in front
     // of a few steps before (steps of an unsure comparison included).
     let mut faces = en.mul_pt(&gate, &plan.rails)?;
-    if let Some((first_faces, others)) = plan.block_faces.split_first() {
+    if let Some(transform) = &plan.spread {
         // Each block's value, from its first face's slot to all of its faces.
-        let mut spread = en.mul_pt(&gate, first_faces)?;
-        for (i, mask) in others.iter().enumerate() {
-            en.add_assign(&mut spread, &en.mul_pt(&en.rotate(&gate, -(i as i64 + 1))?, mask)?)?;
-        }
+        let spread = en.transform(&gate, &en.rotations_of(&gate, &plan.spread_shifts)?, transform)?;
         let face_before = en.rotate(&c, -f * FACE_LAG as i64)?;
         en.add_assign(&mut faces, &spread)?;
         en.sub_assign(&mut faces, &en.mul(&spread, &face_before)?)?;

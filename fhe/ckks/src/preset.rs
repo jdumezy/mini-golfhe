@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use poulpy_ckks::layouts::{BootstrappingKeysLayout, BootstrappingPlan, EncapsulationKeysLayout};
 use poulpy_ckks::presets::bootstrapping::BootstrappingPreset;
+use poulpy_ckks::presets::first_factor::{first_factor_diagonal_growth, first_factor_small_bits, first_factor_work};
 use poulpy_core::layouts::{Base2K, Degree, GGLWEInfos, GGLWELayout, Rank, TorusPrecision};
 
 /// Largest modulus, in bits, for 128-bit security at `N = 2^16`, by secret
@@ -81,17 +82,38 @@ impl Preset {
             .iter()
             .map(|(&p, &k)| Ok((p, shape("rotation", k)?.into())))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        // With the first CoeffsToSlots factor on the raise, its keys replace the sparse-to-dense one.
+        let first_factor_on_raise = base.keys_layout().first_factor_key.is_some();
+        let raised = plan.raised_window(log_modulus);
+        let first_factor_key = if first_factor_on_raise {
+            let (work, _) = first_factor_work(base2k, bootstrap_k);
+            let growth = first_factor_diagonal_growth(base2k, &plan.coeffs_to_slots().coeffs_meta());
+            let small = first_factor_small_bits(base2k, log_n, bootstrap_k, raised, growth).div_ceil(base2k);
+            ensure!(
+                small < work,
+                "first-factor key: a term of {small} limbs does not fit the {work} the raise works at"
+            );
+            let k_offset = (work - small) * base2k;
+            let below = DENSE_MAX_MODULUS.saturating_sub(k_offset);
+            let input = small * base2k;
+            let layout = keys.key_layout("first-factor", input, keys.widest_k_digit(input, below), below)?;
+            Some(GGLWELayout { k_offset: TorusPrecision(k_offset as u32), ..layout }.into())
+        } else {
+            None
+        };
+        ensure!(base.keys_layout().conversion_keys.is_none(), "EvalMod must run on the standard ring");
         let keys_layout = BootstrappingKeysLayout {
             rotation_keys,
             tensor_key: shape("tensor", widths.tensor_key)?.into(),
             encapsulation: Some(EncapsulationKeysLayout {
                 dense_to_sparse: keys.key_layout("dense-to-sparse", log_modulus, base2k, SPARSE_MAX_MODULUS)?.into(),
-                sparse_to_dense: Some(
-                    keys.sparse_to_dense_layout(plan.raised_window(log_modulus), bootstrap_k, DENSE_MAX_MODULUS)?
-                        .into(),
-                ),
+                sparse_to_dense: if first_factor_on_raise {
+                    None
+                } else {
+                    Some(keys.sparse_to_dense_layout(raised, bootstrap_k, DENSE_MAX_MODULUS)?.into())
+                },
             }),
-            first_factor_key: None,
+            first_factor_key,
             conversion_keys: None,
         };
         let preset = Preset {
@@ -144,6 +166,9 @@ impl Preset {
         out.push(("dense-to-sparse".into(), enc.dense_to_sparse.gglwe_layout(), SPARSE_MAX_MODULUS));
         if let Some(key) = &enc.sparse_to_dense {
             out.push(("sparse-to-dense".into(), key.gglwe_layout(), DENSE_MAX_MODULUS));
+        }
+        if let Some(key) = &keys.first_factor_key {
+            out.push(("first-factor".into(), key.gglwe_layout(), DENSE_MAX_MODULUS));
         }
         Ok(out)
     }
