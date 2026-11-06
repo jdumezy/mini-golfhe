@@ -226,6 +226,7 @@ export class CourseView extends EventTarget {
   private userZoomed = false;
   private pointer:
     | { mode: "orbit"; id: number; x: number; y: number; moved: boolean }
+    | { mode: "pan"; id: number; grab: THREE.Vector3 }
     | { mode: "aim"; id: number }
     | null = null;
   private playing: {
@@ -292,6 +293,7 @@ export class CourseView extends EventTarget {
     canvas.addEventListener("pointerup", (e) => this.onPointerUp(e));
     canvas.addEventListener("pointercancel", () => this.cancelPointer());
     canvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(container);
@@ -437,38 +439,38 @@ export class CourseView extends EventTarget {
       for (const p of [outer[0], outer[i + 1], outer[i]]) base.vertex(new THREE.Vector3(p[0], baseY, -p[1]), down);
     add(base.build(), new THREE.MeshStandardMaterial({ color: COLORS.base, roughness: 1 }), false);
 
-    // Blocks.
-    const blockMaterial = new THREE.MeshStandardMaterial({ color: COLORS.block, roughness: 0.75 });
-    const hedgeMaterial = new THREE.MeshStandardMaterial({ color: COLORS.hedge, roughness: 1 });
+    // Blocks, hedges and bumpers.
+    const materials = {
+      block: new THREE.MeshStandardMaterial({ color: COLORS.block, roughness: 0.75 }),
+      hedge: new THREE.MeshStandardMaterial({ color: COLORS.hedge, roughness: 1 }),
+      bumper: new THREE.MeshStandardMaterial({ color: COLORS.bumper, roughness: 0.45 }),
+      bumperTop: new THREE.MeshStandardMaterial({ color: COLORS.bumperTop, roughness: 0.5 }),
+    };
+    const up = new THREE.Vector3(0, 1, 0);
+    /** A flat polygon at `lift` above the terrain, fanned from its centroid. */
+    const lid = (pts: Vec2[], lift: number, g: GeometryBuilder) => {
+      const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+      const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+      const center = toWorld(hole, cx, cy, lift);
+      pts.forEach((a, i) => {
+        const b = pts[(i + 1) % pts.length];
+        for (const p of [center, toWorld(hole, a[0], a[1], lift), toWorld(hole, b[0], b[1], lift)]) g.vertex(p, up);
+      });
+    };
     for (const o of hole.obstacles) {
-      if (o.kind === "block") {
-        const hedge = o.style === "hedge";
-        const top = hedge ? HEDGE_HEIGHT : BLOCK_HEIGHT;
-        const g = new GeometryBuilder();
-        const pts = prism(hole, o.points, top, (x, y) => height(hole.terrain, x, y) - 0.02, g);
-        const upN = new THREE.Vector3(0, 1, 0);
-        const [cx, cy] = [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
-        const center = toWorld(hole, cx, cy, top);
-        pts.forEach((a, i) => {
-          const b = pts[(i + 1) % pts.length];
-          for (const p of [center, toWorld(hole, a[0], a[1], top), toWorld(hole, b[0], b[1], top)]) g.vertex(p, upN);
-        });
-        add(g.build(), hedge ? hedgeMaterial : blockMaterial);
-      } else if (o.kind === "bumper") {
-        const [cx, cy] = o.center;
-        const base = height(hole.terrain, cx, cy);
-        const body = new THREE.Mesh(
-          new THREE.CylinderGeometry(o.radius, o.radius, BLOCK_HEIGHT + 0.03, 40),
-          new THREE.MeshStandardMaterial({ color: COLORS.bumper, roughness: 0.45 }),
-        );
-        body.position.set(cx, base + (BLOCK_HEIGHT - 0.03) / 2, -cy);
-        body.castShadow = body.receiveShadow = true;
-        const cap = new THREE.Mesh(
-          new THREE.CylinderGeometry(o.radius * 0.55, o.radius * 0.55, 0.004, 32),
-          new THREE.MeshStandardMaterial({ color: COLORS.bumperTop, roughness: 0.5 }),
-        );
-        cap.position.set(cx, base + BLOCK_HEIGHT + 0.002, -cy);
-        this.courseGroup.add(body, cap);
+      if (o.kind !== "block") continue;
+      const style = o.style ?? "block";
+      const top = style === "hedge" ? HEDGE_HEIGHT : style === "bumper" ? BLOCK_HEIGHT + 0.03 : BLOCK_HEIGHT;
+      const g = new GeometryBuilder();
+      lid(prism(hole, o.points, top, (x, y) => height(hole.terrain, x, y) - 0.02, g), top, g);
+      add(g.build(), materials[style]);
+      if (style === "bumper") {
+        // A white octagon on top, half the size.
+        const cx = o.points.reduce((s, p) => s + p[0], 0) / o.points.length;
+        const cy = o.points.reduce((s, p) => s + p[1], 0) / o.points.length;
+        const cap = new GeometryBuilder();
+        lid(o.points.map(([x, y]) => [cx + (x - cx) * 0.55, cy + (y - cy) * 0.55] as Vec2), top + 0.002, cap);
+        add(cap.build(), materials.bumperTop, false);
       }
     }
 
@@ -600,10 +602,40 @@ export class CourseView extends EventTarget {
     return Math.hypot(e.clientX - sx, e.clientY - sy) < 36;
   }
 
+  /** The point under the pointer on the horizontal plane through the view's target. */
+  private targetPlanePoint(e: PointerEvent): THREE.Vector3 | null {
+    this.raycaster.setFromCamera(this.ndc(e), this.camera);
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.target.y);
+    return this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+  }
+
+  /** Moves the view across the course, `dx` right and `dy` forward as seen on screen, in metres. */
+  pan(dx: number, dy: number) {
+    const [c, s] = [Math.cos(this.heading), Math.sin(this.heading)];
+    // Forward is the heading (course (c, s) → world (c, −s)); right is a quarter turn clockwise.
+    this.moveTarget(dy * c + dx * s, -(dy * s) + dx * c);
+  }
+
+  private moveTarget(wx: number, wz: number) {
+    if (!this.hole) return;
+    const { x0, y0, x1, y1 } = bounds(this.hole.spec.boundary);
+    const margin = 1;
+    this.target.x = Math.min(x1 + margin, Math.max(x0 - margin, this.target.x + wx));
+    this.target.z = Math.min(-y0 + margin, Math.max(-y1 - margin, this.target.z + wz));
+    this.updateCamera();
+  }
+
   private onPointerDown(e: PointerEvent) {
-    if (this.pointer || (e.pointerType === "mouse" && e.button !== 0)) return;
+    if (this.pointer) return;
+    // Right or middle button, or shift with the left one: pan.
+    const panning = e.pointerType === "mouse" && (e.button === 1 || e.button === 2 || (e.button === 0 && e.shiftKey));
+    if (e.pointerType === "mouse" && e.button !== 0 && !panning) return;
     this.renderer.domElement.setPointerCapture(e.pointerId);
-    if (this.aimEnabled && this.ball.visible && this.nearBall(e)) {
+    const grab = panning ? this.targetPlanePoint(e) : null;
+    if (grab) {
+      this.pointer = { mode: "pan", id: e.pointerId, grab };
+      this.renderer.domElement.style.cursor = "move";
+    } else if (this.aimEnabled && this.ball.visible && this.nearBall(e)) {
       this.pointer = { mode: "aim", id: e.pointerId };
       this.renderer.domElement.style.cursor = "grabbing";
     } else {
@@ -617,6 +649,12 @@ export class CourseView extends EventTarget {
       return;
     }
     if (this.pointer.id !== e.pointerId) return;
+    if (this.pointer.mode === "pan") {
+      // Keep the grabbed point under the pointer.
+      const p = this.targetPlanePoint(e);
+      if (p) this.moveTarget(this.pointer.grab.x - p.x, this.pointer.grab.z - p.z);
+      return;
+    }
     if (this.pointer.mode === "orbit") {
       const dx = e.clientX - this.pointer.x;
       const dy = e.clientY - this.pointer.y;

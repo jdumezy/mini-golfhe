@@ -99,6 +99,8 @@ export function playback(hole: Hole, shot: Shot, physics: PhysicsSpec = PHYSICS)
       samples.push(s);
     }
     if (!next) break;
+    // No contact: the next segment carries on from where this one ends.
+    if (next.contact === false) continue;
     // Show the ball touching the obstacle, between the last free sample and the bounce.
     const before = sample(next.t, advance(flow, steps, state));
     const touch = firstContact(hole, samples[samples.length - 1], before);

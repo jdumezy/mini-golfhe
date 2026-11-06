@@ -51,6 +51,62 @@ let lastShot: { aim: Aim; shot: Shot; pb: Playback; playbackMs: number } | null 
 let lastStats: fhe.ShotStats | null = null;
 /** Waiting for the client to encrypt, have the server simulate, and decrypt. */
 let requesting = false;
+let requestStart = 0;
+let requestTimer: number | undefined;
+let lastProgress: fhe.Progress | null = null;
+let progressPending = false;
+const progress = $("progress");
+const progressBar = $("progress-bar");
+
+function setRequesting(on: boolean) {
+  requesting = on;
+  clearInterval(requestTimer);
+  lastProgress = null;
+  progress.hidden = !on;
+  setProgress(0);
+  if (on) {
+    requestStart = performance.now();
+    requestTimer = window.setInterval(pollProgress, 250);
+  }
+}
+
+function setProgress(fraction: number) {
+  const percent = Math.round(Math.min(1, Math.max(0, fraction)) * 100);
+  progressBar.style.width = `${percent}%`;
+  progress.setAttribute("aria-valuenow", String(percent));
+}
+
+/** Follows the encrypted simulation: client steps around the server's contacts. */
+async function pollProgress() {
+  refreshStatusLine();
+  if (progressPending) return;
+  progressPending = true;
+  try {
+    const p = await fhe.fetchProgress();
+    if (!requesting) return;
+    lastProgress = p;
+    const evaluated = p.server?.fraction ?? (p.step === "decrypting" ? 1 : 0);
+    setProgress(p.step === "idle" ? 0 : 0.02 + 0.96 * evaluated + (p.step === "decrypting" ? 0.02 : 0));
+  } catch {
+  } finally {
+    progressPending = false;
+  }
+}
+
+const STEP_LABELS = {
+  gaps: "gaps to every face",
+  bootstrapping: "bootstrapping",
+  contact: "first contact",
+  output: "packing contacts",
+} as const;
+
+function progressLabel(): string {
+  const p = lastProgress;
+  if (!p || p.step === "idle") return "encrypting…";
+  if (p.step !== "evaluating" || !p.server) return `${p.step}…`;
+  const { contact, contacts, step } = p.server;
+  return `contact ${Math.min(contact + 1, contacts)}/${contacts}, ${STEP_LABELS[step]}`;
+}
 
 const parTotal = HOLES.reduce((s, h) => s + h.spec.par, 0);
 
@@ -79,6 +135,8 @@ function startHole(index: number) {
   phase = "aiming";
   message = "";
   showHole();
+// The keys take a while to generate and upload: follow them.
+refreshClientStatus();
   saveRound();
 }
 
@@ -100,14 +158,14 @@ async function shoot(aim: Aim) {
   round.strokes++;
   lastPower = aim.power;
 
-  requesting = true;
+  setRequesting(true);
   refresh();
   let result: fhe.ShotResult;
   try {
     result = await fhe.shoot(hole.index, shotState(from, aim.angle, aim.power));
   } catch (e) {
     // The shot never happened.
-    requesting = false;
+    setRequesting(false);
     round.strokes--;
     phase = "aiming";
     message = `error: ${e instanceof Error ? e.message : String(e)}`;
@@ -116,7 +174,7 @@ async function shoot(aim: Aim) {
     refreshClientStatus();
     return;
   }
-  requesting = false;
+  setRequesting(false);
   lastStats = result.stats;
   const t0 = performance.now();
   const pb = playback(hole, result.shot);
@@ -182,6 +240,9 @@ $("new-round").addEventListener("click", () => {
 
 // --- Keyboard ---------------------------------------------------------------------
 
+/** W A S D move the view across the course. */
+const PAN_KEYS: Record<string, [number, number]> = { w: [0, 1], s: [0, -1], a: [-1, 0], d: [1, 0] };
+
 window.addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.target instanceof HTMLElement && e.target.closest("input, textarea, [contenteditable]")) return;
@@ -192,6 +253,9 @@ window.addEventListener("keydown", (e) => {
   } else if (phase === "aiming" && aim && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
     const step = e.shiftKey ? 0.005 : 0.02;
     view.setAim({ ...aim, power: Math.min(1, Math.max(0, aim.power + (e.key === "ArrowUp" ? step : -step))) });
+  } else if (PAN_KEYS[e.key.toLowerCase()]) {
+    const [dx, dy] = PAN_KEYS[e.key.toLowerCase()];
+    view.pan(dx * 0.25, dy * 0.25);
   } else if (e.key === " " && !e.repeat && phase === "aiming" && aim) {
     void shoot(aim);
   } else if (e.key === "Enter" && !e.repeat && phase === "holed") {
@@ -264,39 +328,76 @@ function formatMs(ms: number): string {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+const SETUP_LABELS: Record<fhe.SetupPhase["phase"], string> = {
+  preparing: "preparing",
+  generating_keys: "generating keys",
+  uploading: "uploading keys",
+  ready: "ready",
+  waiting_for_server: "waiting for the server",
+  failed: "setup failed",
+};
+
+let statusTimer: number | undefined;
+let clientSetup: fhe.SetupPhase | null = null;
+
 async function refreshClientStatus() {
   let s: fhe.Status | null = null;
   try {
     s = await fhe.fetchStatus();
   } catch {}
+  clearTimeout(statusTimer);
   if (!s) {
-    for (const name of ["fheScheme", "fheServer", "fheSimulation", "fheKey"]) stat(name).textContent = "–";
+    clientSetup = null;
+    for (const name of ["fheScheme", "fheBackend", "fheClientBackend", "fheServer", "fheCircuit", "fheKey", "fheKeyTimes"])
+      stat(name).textContent = "–";
     stat("fheClient").textContent = "not running";
     return;
   }
   const { client, server } = s;
-  stat("fheScheme").textContent = client.scheme;
-  stat("fheClient").textContent = `running, v${client.version}`;
-  stat("fheServer").textContent = server.error
-    ? `${server.reachable ? "reachable" : "unreachable"} at ${server.addr}: ${server.error}`
-    : `reachable at ${server.addr}`;
-  stat("fheSimulation").textContent =
-    server.max_contacts !== null
-      ? `${server.max_contacts} contacts × ${server.steps} steps of ${(server.dt! * 1000).toFixed(0)} ms`
+  const setup = (clientSetup = client.setup);
+  stat("fheScheme").textContent = client.params ? `${client.scheme}, ${client.params}` : client.scheme;
+  // The server evaluates, possibly on a GPU; the client generates keys and encrypts on the CPU.
+  stat("fheBackend").textContent = server.info?.backend ?? "–";
+  stat("fheClientBackend").textContent = client.backend;
+  let clientText = `v${client.version}`;
+  if (setup) {
+    clientText += `, ${SETUP_LABELS[setup.phase]}`;
+    if (setup.phase === "uploading") clientText += ` (${formatBytes(setup.sent_bytes)})`;
+  }
+  stat("fheClient").textContent = clientText;
+  stat("fheServer").textContent = server.reachable
+    ? `${server.addr}, ${server.info?.key_id ? "keys installed" : "no keys"}${server.error ? `, ${server.error}` : ""}`
+    : `unreachable at ${server.addr}`;
+  const info = server.info;
+  stat("fheCircuit").textContent = info
+    ? `${info.max_contacts} contacts × ${info.steps} steps of ${(info.dt * 1000).toFixed(0)} ms × 32 faces`
+    : "–";
+  stat("fheKey").textContent = setup?.phase === "ready" ? formatBytes(setup.key_bytes) : "–";
+  stat("fheKeyTimes").textContent =
+    setup?.phase === "ready" && client.keygen_ms
+      ? `${formatMs(client.keygen_ms)} / ${formatMs(setup.server_prepare_ms)}`
       : "–";
-  stat("fheKey").textContent = `${formatBytes(client.eval_key_bytes)} (keygen ${formatMs(client.keygen_ms)})`;
+  refresh();
+  // Follow the key setup while it runs.
+  if (setup && setup.phase !== "ready" && setup.phase !== "failed") {
+    statusTimer = window.setTimeout(refreshClientStatus, 1000);
+  }
 }
 
 function refreshLastShot() {
   const s = lastStats;
   if (!s) return;
-  stat("fheCiphertexts").textContent = `${formatBytes(s.shot_bytes)} / ${formatBytes(s.trajectory_bytes)}`;
-  stat("fheTraffic").textContent = `${formatBytes(s.upload_bytes)} / ${formatBytes(s.download_bytes)}`;
-  stat("fheEncrypt").textContent = formatMs(s.encrypt_ms);
+  const ckks = s.input_bytes !== undefined;
+  stat("fheCiphertexts").textContent = ckks
+    ? `${formatBytes(s.input_bytes!)} / ${formatBytes(s.output_bytes!)}`
+    : `${formatBytes(s.upload_bytes)} / ${formatBytes(s.download_bytes)} (plaintext)`;
+  stat("fheEncrypt").textContent = ckks ? formatMs(s.encrypt_ms!) : "–";
   stat("fheSimulate").textContent = formatMs(s.simulate_ms);
-  stat("fheDecrypt").textContent = formatMs(s.decrypt_ms);
+  stat("fheRefresh").textContent = ckks ? String(s.refreshes) : "–";
+  stat("fheDecrypt").textContent = ckks ? formatMs(s.decrypt_ms!) : "–";
   stat("fheTotal").textContent = `${formatMs(s.network_ms)} / ${formatMs(s.total_ms)}`;
   stat("fheContacts").textContent = `${s.contacts} / ${s.slots}`;
+  stat("fheConfidence").textContent = s.confidence.map((c) => c.toFixed(4)).join(" ");
 }
 
 function refreshRenderStats() {
@@ -355,6 +456,18 @@ function refreshScorecard() {
   scorecard.replaceChildren(...rows);
 }
 
+function refreshStatusLine() {
+  if (requesting)
+    status.textContent = `${progressLabel()} ${((performance.now() - requestStart) / 1000).toFixed(1)} s`;
+  else if (phase === "rolling") status.textContent = "rolling…";
+  else if (message) status.textContent = message;
+  else if (clientSetup && clientSetup.phase !== "ready")
+    status.textContent = `encryption keys: ${SETUP_LABELS[clientSetup.phase]}${
+      clientSetup.phase === "uploading" ? ` (${formatBytes(clientSetup.sent_bytes)})` : ""
+    }…`;
+  else status.textContent = "";
+}
+
 function refresh() {
   const hole = HOLES[round.hole];
   $("hole-title").textContent = `Hole ${round.hole + 1}`;
@@ -363,7 +476,7 @@ function refresh() {
   shootButton.hidden = phase === "holed" || phase === "finished";
   shootButton.disabled = phase !== "aiming";
   nextButton.hidden = phase !== "holed";
-  status.textContent = requesting ? "encrypting, simulating, decrypting…" : phase === "rolling" ? "rolling…" : message;
+  refreshStatusLine();
   refreshPower();
   refreshScorecard();
 
@@ -372,8 +485,8 @@ function refresh() {
   const counts = { rail: 0, block: 0, bumper: 0 };
   let faces = 0;
   for (const o of hole.obstacles) {
-    counts[o.kind]++;
-    faces += o.kind === "bumper" ? 1 : o.faces.length;
+    counts[o.kind === "block" && o.style === "bumper" ? "bumper" : o.kind]++;
+    faces += o.faces.length;
   }
   const steps = Math.round(PHYSICS.horizon / PHYSICS.dt);
   stat("hole").textContent = `${round.hole + 1} / ${hole.spec.par}`;
@@ -403,3 +516,5 @@ function refresh() {
 }
 
 showHole();
+// The keys take a while to generate and upload: follow them.
+refreshClientStatus();

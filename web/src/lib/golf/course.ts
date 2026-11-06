@@ -3,7 +3,7 @@
  * `course.json`, and their compiled form (wall faces, terrain gradient) that
  * the simulation and the renderer use.
  *
- * A hole is a convex boundary of rails, convex blocks and round bumpers inside
+ * A hole is a convex boundary of rails, convex blocks and octagonal bumpers inside
  * it, water ponds (which end the shot), and one quadratic terrain. Everything
  * the encrypted simulation needs is linear or quadratic in the ball's state.
  */
@@ -79,14 +79,14 @@ export interface Face {
 
 export type Obstacle =
   | { kind: "rail"; faces: Face[]; restitution: number }
-  | { kind: "block"; points: Vec2[]; faces: Face[]; restitution: number; style?: "hedge" }
-  | { kind: "bumper"; center: Vec2; radius: number; reach: number; restitution: number };
+  /** Bumpers are octagonal blocks, bouncier, drawn as posts. */
+  | { kind: "block"; points: Vec2[]; faces: Face[]; restitution: number; style?: "hedge" | "bumper" };
 
 export interface Hole {
   index: number;
   spec: HoleSpec;
   terrain: TerrainSpec;
-  /** The rails first (inward normals), then blocks and bumpers (outward normals). */
+  /** The rail first (inward normals), then blocks and bumpers (outward normals). */
   obstacles: Obstacle[];
 }
 
@@ -148,6 +148,14 @@ function polygonFaces(p: Vec2[], inward: boolean, radius: number): Face[] {
   });
 }
 
+/** The regular octagon with its corners on the circle of `radius` around `c`, counter-clockwise. */
+export function octagon(c: Vec2, radius: number): Vec2[] {
+  return Array.from({ length: 8 }, (_, i) => {
+    const a = ((i + 0.5) * Math.PI) / 4;
+    return [c[0] + radius * Math.cos(a), c[1] + radius * Math.sin(a)] as Vec2;
+  });
+}
+
 export const clearance = (f: Face, x: number, y: number) => f.n[0] * x + f.n[1] * y - f.b;
 
 /** Whether the point is strictly inside a convex counter-clockwise polygon. */
@@ -167,8 +175,6 @@ export function touches(o: Obstacle, x: number, y: number): boolean {
       return o.faces.some((f) => clearance(f, x, y) < 0);
     case "block":
       return o.faces.every((f) => clearance(f, x, y) < 0);
-    case "bumper":
-      return (x - o.center[0]) ** 2 + (y - o.center[1]) ** 2 < o.reach ** 2;
   }
 }
 
@@ -190,12 +196,13 @@ export function compileHole(spec: HoleSpec, index: number, physics: PhysicsSpec 
         style: o.style,
       });
     } else {
+      const points = octagon(o.center, o.radius);
       obstacles.push({
-        kind: "bumper",
-        center: o.center,
-        radius: o.radius,
-        reach: o.radius + r,
+        kind: "block",
+        points,
+        faces: polygonFaces(points, false, r),
         restitution: o.restitution ?? physics.restitution.bumper,
+        style: "bumper",
       });
     }
   }

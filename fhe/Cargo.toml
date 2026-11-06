@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["course", "physics", "protocol", "client", "server"]
+members = ["course", "physics", "circuit", "ckks", "protocol", "client", "server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,9 +10,27 @@ license = "Apache-2.0"
 [workspace.dependencies]
 mini-golfhe-course = { path = "course" }
 mini-golfhe-physics = { path = "physics" }
+mini-golfhe-circuit = { path = "circuit" }
+mini-golfhe-ckks = { path = "ckks" }
 mini-golfhe-protocol = { path = "protocol" }
+anyhow = "1"
+# poulpy, pinned to its release.
+poulpy-hal = "=0.10.0"
+poulpy-core = "=0.10.0"
+poulpy-ckks = "=0.10.0"
+poulpy-cpu-arm = "=0.10.0"
+poulpy-cpu-avx = "=0.10.0"
+poulpy-cpu-avx512 = "=0.10.0"
+poulpy-cpu-portable = "=0.10.0"
+poulpy-gpu-portable = "=0.10.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "time"] }
 axum = "0.8"
+
+# The circuit plans and their tests are slow unoptimized; keep tests and dev runs usable.
+[profile.dev.package.mini-golfhe-physics]
+opt-level = 3
+[profile.dev.package.mini-golfhe-circuit]
+opt-level = 3

@@ -81,10 +81,12 @@ export function flowOf(hole: Hole): Flow {
 export interface Segment {
   t: number;
   state: State;
+  /** It starts at a contact (a bounce); otherwise it continues the segment before. */
+  contact?: boolean;
 }
 
 export interface Shot {
-  /** The shot, then the state after each contact. */
+  /** The shot, then the state after each contact the server searched for. */
   segments: Segment[];
   /** Whether all contacts were spent: the last segment was not searched. */
   exhausted: boolean;

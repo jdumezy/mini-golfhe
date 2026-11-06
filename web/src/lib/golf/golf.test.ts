@@ -138,6 +138,27 @@ describe("playback", () => {
     expect(p.final[0]).toBeCloseTo(10 - PHYSICS.ballRadius, 3);
   });
 
+  it("carries on across a segment that ends without contact", () => {
+    const h = hole({ terrain: { center: [5, 5], hessian: [0.1, 0, 0.1], slope: [0, 0] } });
+    const flow = flowOf(h);
+    const s0: State = [5, 5, 3, 0.5];
+    // The server found no contact in the first segment: it continues from its last step.
+    const t = (flow.steps - 1) * flow.dt;
+    const split: Shot = {
+      segments: [
+        { t: 0, state: s0 },
+        { t, state: advance(flow, flow.steps - 1, s0), contact: false },
+      ],
+      exhausted: false,
+    };
+    const alone = playback(h, free(s0));
+    const pieces = playback(h, split);
+    // The same path over the first segment, which alone would end there; then on, without a bounce.
+    pieces.samples.slice(0, alone.samples.length).forEach((s, i) => expect(s.x).toBeCloseTo(alone.samples[i].x, 9));
+    expect(pieces.samples[pieces.samples.length - 1].t).toBeGreaterThan(t);
+    expect(pieces.samples.some((s) => s.contact)).toBe(false);
+  });
+
   it("stops before the next obstacle once the contacts are spent", () => {
     const p = playback(hole(), { segments: [{ t: 0, state: [5, 5, 5, 0] }], exhausted: true });
     expect(p.outcome).toBe("rest");

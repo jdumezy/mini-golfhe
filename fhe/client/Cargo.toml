@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 mini-golfhe-course.workspace = true
 mini-golfhe-physics.workspace = true
+mini-golfhe-circuit.workspace = true
+mini-golfhe-ckks.workspace = true
 mini-golfhe-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

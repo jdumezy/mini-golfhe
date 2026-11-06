@@ -131,20 +131,9 @@ impl Face {
 #[derive(Debug, Clone)]
 pub enum Obstacle {
     /// The boundary, inward normals: the ball touches it when any face's clearance is negative.
-    Rail {
-        faces: Vec<Face>,
-        restitution: f64,
-    },
+    Rail { faces: Vec<Face>, restitution: f64 },
     /// Outward normals: the ball touches it when every face's clearance is negative.
-    Block {
-        faces: Vec<Face>,
-        restitution: f64,
-    },
-    Bumper {
-        center: Vec2,
-        reach: f64,
-        restitution: f64,
-    },
+    Block { faces: Vec<Face>, restitution: f64 },
 }
 
 impl Obstacle {
@@ -153,16 +142,33 @@ impl Obstacle {
         match self {
             Obstacle::Rail { faces, .. } => faces.iter().any(|f| f.clearance(x, y) < 0.0),
             Obstacle::Block { faces, .. } => faces.iter().all(|f| f.clearance(x, y) < 0.0),
-            Obstacle::Bumper { center, reach, .. } => (x - center[0]).powi(2) + (y - center[1]).powi(2) < reach * reach,
         }
     }
+}
 
-    /// Faces (one per bumper) tested for contact at each grid step.
-    pub fn faces(&self) -> usize {
-        match self {
-            Obstacle::Rail { faces, .. } | Obstacle::Block { faces, .. } => faces.len(),
-            Obstacle::Bumper { .. } => 1,
-        }
+/// Faces the encrypted simulation tests at each time step, at most: it packs
+/// 256 steps × 32 faces into a quarter of a ciphertext's slots.
+pub const MAX_FACES: usize = 32;
+
+/// What the simulation tests for contact: each rail face on its own, and
+/// each block (bumpers included). The ball is inside a detector when it is
+/// behind all of its faces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Detector {
+    /// Its faces, `faces[first..first + count]` of the hole.
+    pub first: usize,
+    pub count: usize,
+    pub rail: bool,
+    pub restitution: f64,
+}
+
+impl Detector {
+    pub fn faces<'a>(&self, faces: &'a [Face]) -> &'a [Face] {
+        &faces[self.first..self.first + self.count]
+    }
+
+    pub fn inside(&self, faces: &[Face], x: f64, y: f64) -> bool {
+        self.faces(faces).iter().all(|f| f.clearance(x, y) < 0.0)
     }
 }
 
@@ -173,6 +179,44 @@ pub struct Hole {
     pub terrain: Terrain,
     /// The rail first, then blocks and bumpers.
     pub obstacles: Vec<Obstacle>,
+    /// Every face the simulation tests, by detector.
+    pub faces: Vec<Face>,
+    pub detectors: Vec<Detector>,
+}
+
+/// The regular octagon with its corners on the circle of `radius` around `c`,
+/// counter-clockwise, its faces facing the axes and the diagonals.
+pub fn octagon(c: Vec2, radius: f64) -> Vec<Vec2> {
+    (0..8)
+        .map(|i| {
+            let a = (i as f64 + 0.5) * std::f64::consts::FRAC_PI_4;
+            [c[0] + radius * a.cos(), c[1] + radius * a.sin()]
+        })
+        .collect()
+}
+
+fn detectors(obstacles: &[Obstacle]) -> (Vec<Face>, Vec<Detector>) {
+    let (mut faces, mut detectors) = (Vec::new(), Vec::new());
+    for o in obstacles {
+        match o {
+            Obstacle::Rail { faces: fs, restitution } => {
+                for f in fs {
+                    detectors.push(Detector { first: faces.len(), count: 1, rail: true, restitution: *restitution });
+                    faces.push(*f);
+                }
+            }
+            Obstacle::Block { faces: fs, restitution } => {
+                detectors.push(Detector {
+                    first: faces.len(),
+                    count: fs.len(),
+                    rail: false,
+                    restitution: *restitution,
+                });
+                faces.extend(fs);
+            }
+        }
+    }
+    (faces, detectors)
 }
 
 #[derive(Debug, Clone)]
@@ -243,9 +287,9 @@ fn compile_hole(spec: HoleSpec, index: usize, physics: &Physics) -> Result<Hole,
                     restitution: restitution.unwrap_or(physics.restitution.block),
                 }
             }
-            ObstacleSpec::Bumper { center, radius, restitution } => Obstacle::Bumper {
-                center: *center,
-                reach: radius + r,
+            // An octagonal post: a block with the bumper's restitution.
+            ObstacleSpec::Bumper { center, radius, restitution } => Obstacle::Block {
+                faces: polygon_faces(&octagon(*center, *radius), false, r),
                 restitution: restitution.unwrap_or(physics.restitution.bumper),
             },
         });
@@ -261,8 +305,12 @@ fn compile_hole(spec: HoleSpec, index: usize, physics: &Physics) -> Result<Hole,
             return Err(format!("{at}: the {label} is in water"));
         }
     }
+    let (faces, detectors) = detectors(&obstacles);
+    if faces.len() > MAX_FACES {
+        return Err(format!("{at}: {} faces to test, the simulation handles {MAX_FACES}", faces.len()));
+    }
     let terrain = spec.terrain.clone().unwrap_or(Terrain::FLAT);
-    Ok(Hole { index, spec, terrain, obstacles })
+    Ok(Hole { index, spec, terrain, obstacles, faces, detectors })
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {

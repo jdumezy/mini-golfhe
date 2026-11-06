@@ -20,7 +20,7 @@
 //! Bounce responses use only arithmetic that CKKS evaluates exactly (a fixed
 //! Newton step replaces the bumper normal's square root).
 
-use mini_golfhe_course::{Hole, Obstacle, Physics, Terrain};
+use mini_golfhe_course::{Detector, Hole, Physics, Terrain};
 
 /// x, y, vx, vy.
 pub type State = [f64; 4];
@@ -108,56 +108,33 @@ impl Flow {
     }
 }
 
-/// The bounce off `o` of a ball at state `s` (and `prev` one grid step
-/// before), or None if it is not in contact and approaching.
-fn bounce(o: &Obstacle, s: &State, prev: &State) -> Option<State> {
+/// Steps back at which a block's entered faces are told (see [`bounce`]).
+pub const FACE_LAG: usize = 3;
+
+/// The change of state `s` takes bouncing off detector `d`, entered at this
+/// step (`prev` is the state [`FACE_LAG`] steps before, or at the segment's
+/// start): off every face the ball came through, the faces it was still in
+/// front of then (a rail has one).
+pub fn bounce(hole: &Hole, d: &Detector, s: &State, prev: &State) -> State {
     let [x, y, vx, vy] = *s;
-    let mut d = [0.0; 4];
-    let mut hit = false;
-    // Reflect the normal velocity and mirror the penetration, both scaled by 1 + e.
-    let mut add = |nx: f64, ny: f64, depth: f64, e: f64| {
-        let vn = nx * vx + ny * vy;
-        d[0] -= (1.0 + e) * depth * nx;
-        d[1] -= (1.0 + e) * depth * ny;
-        d[2] -= (1.0 + e) * vn * nx;
-        d[3] -= (1.0 + e) * vn * ny;
-        hit = true;
-    };
-    match o {
-        Obstacle::Rail { faces, restitution } => {
-            for f in faces {
-                let c = f.clearance(x, y);
-                if c < 0.0 && f.n[0] * vx + f.n[1] * vy < 0.0 {
-                    add(f.n[0], f.n[1], c, *restitution);
-                }
-            }
-        }
-        Obstacle::Block { faces, restitution } => {
-            if faces.iter().all(|f| f.clearance(x, y) < 0.0) {
-                // The faces the ball came through: those it was still outside of a step before.
-                for f in faces {
-                    if f.clearance(prev[0], prev[1]) >= 0.0 && f.n[0] * vx + f.n[1] * vy < 0.0 {
-                        add(f.n[0], f.n[1], f.clearance(x, y), *restitution);
-                    }
-                }
-            }
-        }
-        Obstacle::Bumper { center, reach, restitution } => {
-            let (ux, uy) = ((x - center[0]) / reach, (y - center[1]) / reach);
-            let m = ux * ux + uy * uy;
-            if m < 1.0 && ux * vx + uy * vy < 0.0 {
-                // 1/|u| by two Newton steps from 1 (|u| is close to 1 at contact).
-                let y1 = (3.0 - m) / 2.0;
-                let inv = y1 * (3.0 - m * y1 * y1) / 2.0;
-                add(ux * inv, uy * inv, reach * (m * inv - 1.0), *restitution);
-            }
+    let mut delta = [0.0; 4];
+    let k = 1.0 + d.restitution;
+    for f in d.faces(&hole.faces) {
+        if d.rail || f.clearance(prev[0], prev[1]) >= 0.0 {
+            // Reflect the normal velocity and mirror the penetration, both scaled by 1 + e.
+            let (depth, vn) = (f.clearance(x, y), f.n[0] * vx + f.n[1] * vy);
+            delta[0] -= k * depth * f.n[0];
+            delta[1] -= k * depth * f.n[1];
+            delta[2] -= k * vn * f.n[0];
+            delta[3] -= k * vn * f.n[1];
         }
     }
-    hit.then_some(d)
+    delta
 }
 
-/// The state right after one contact, at time `t`. Unused contact slots have
-/// `hit == false` and zeros, so every shot has the same output size.
+/// The state right after one contact, at time `t`. When no contact was found
+/// within the segment, `hit` is false and the next segment continues from the
+/// state at the segment's last step; every shot has the same number of contacts.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Contact {
     pub hit: bool,
@@ -165,34 +142,41 @@ pub struct Contact {
     pub state: State,
 }
 
-/// The server's computation: `max_contacts` contacts after the shot `shot`.
+/// The server's computation, in the clear: `max_contacts` contacts after the
+/// shot `shot`.
+///
+/// A segment is followed on the grid `k = 0..steps` from its start. Its
+/// contact is the first step `k ≥ 1` where the ball is inside a detector it
+/// was not inside at the start; it bounces off every such detector. Without
+/// one, the segment ends at its last step.
 pub fn simulate(hole: &Hole, flow: &Flow, physics: &Physics, shot: &State) -> Vec<Contact> {
     let mut contacts = vec![Contact::default(); physics.max_contacts];
     let (mut t, mut start) = (0.0, *shot);
-    for slot in contacts.iter_mut() {
-        let mut prev = start;
+    for contact in contacts.iter_mut() {
+        let at_start: Vec<bool> = hole.detectors.iter().map(|d| d.inside(&hole.faces, start[0], start[1])).collect();
         let mut found = None;
-        for k in 1..=flow.steps {
+        for k in 1..flow.steps {
             let s = flow.advance(k, &start);
-            let mut total = [0.0; 4];
-            let mut hit = false;
-            for o in &hole.obstacles {
-                if let Some(d) = bounce(o, &s, &prev) {
-                    hit = true;
-                    (0..4).for_each(|j| total[j] += d[j]);
+            let prev = flow.advance(k.saturating_sub(FACE_LAG), &start);
+            let mut after = s;
+            for (d, &was) in hole.detectors.iter().zip(&at_start) {
+                if !was && d.inside(&hole.faces, s[0], s[1]) {
+                    let delta = bounce(hole, d, &s, &prev);
+                    (0..4).for_each(|j| after[j] += delta[j]);
+                    found = Some(k);
                 }
             }
-            if hit {
-                found = Some((k, [s[0] + total[0], s[1] + total[1], s[2] + total[2], s[3] + total[3]]));
+            if found.is_some() {
+                start = after;
                 break;
             }
-            prev = s;
         }
-        // No contact within the horizon: the remaining slots stay empty.
-        let Some((k, after)) = found else { break };
+        let k = found.unwrap_or(flow.steps - 1);
+        if found.is_none() {
+            start = flow.advance(k, &start);
+        }
         t += k as f64 * flow.dt;
-        *slot = Contact { hit: true, t, state: after };
-        start = after;
+        *contact = Contact { hit: found.is_some(), t, state: start };
     }
     contacts
 }
@@ -254,7 +238,7 @@ mod tests {
     fn bounces_off_a_rail_keeping_the_tangential_velocity() {
         let (hole, physics) = hole("");
         let flow = Flow::new(&hole.terrain, &physics);
-        let shot = [5.0, 5.0, 4.0, 1.0];
+        let shot = [5.0, 5.0, 5.0, 1.0];
         let c = simulate(&hole, &flow, &physics, &shot);
         assert!(c[0].hit);
         let before = flow.advance((c[0].t / flow.dt).round() as usize, &shot);
@@ -265,13 +249,15 @@ mod tests {
     }
 
     #[test]
-    fn bounces_straight_back_off_a_bumper_hit_head_on() {
+    fn bounces_straight_back_off_an_octagonal_bumper_hit_head_on() {
         let (hole, physics) = hole(r#", "obstacles": [{"kind": "bumper", "center": [5, 5], "radius": 0.1}]"#);
         let flow = Flow::new(&hole.terrain, &physics);
         let c = simulate(&hole, &flow, &physics, &[2.0, 5.0, 3.0, 0.0]);
         let [x, y, vx, vy] = c[0].state;
         assert!(vx < 0.0 && vy.abs() < 1e-9 && (y - 5.0).abs() < 1e-9);
-        assert!(5.0 - x > 0.1 + physics.ball_radius - 1e-3);
+        // Off the face towards −x, at the octagon's apothem.
+        let apothem = 0.1 * (std::f64::consts::PI / 8.0).cos();
+        assert!(5.0 - x > apothem + physics.ball_radius - 1e-3);
     }
 
     #[test]

@@ -5,19 +5,35 @@
  */
 import type { Shot, State } from "../golf";
 
+/** The client's CKKS setup: keys are generated, then uploaded to the server. */
+export type SetupPhase =
+  | { phase: "preparing" }
+  | { phase: "generating_keys" }
+  | { phase: "uploading"; sent_bytes: number }
+  | { phase: "ready"; key_id: number; key_bytes: number; upload_ms: number; server_prepare_ms: number }
+  | { phase: "waiting_for_server"; error: string }
+  | { phase: "failed"; error: string };
+
 export interface Status {
   client: {
     version: string;
     scheme: string;
-    keygen_ms: number;
-    eval_key_bytes: number;
+    backend: string;
+    params: string | null;
+    setup: SetupPhase | null;
+    keygen_ms: number | null;
   };
   server: {
     addr: string;
     reachable: boolean;
-    max_contacts: number | null;
-    steps: number | null;
-    dt: number | null;
+    info: {
+      backend: string;
+      ckks_params: string;
+      key_id: number | null;
+      max_contacts: number;
+      steps: number;
+      dt: number;
+    } | null;
     error: string | null;
   };
 }
@@ -26,16 +42,30 @@ export interface ShotStats {
   scheme: string;
   slots: number;
   contacts: number;
-  eval_key_bytes: number;
-  shot_bytes: number;
-  trajectory_bytes: number;
+  /** Each contact's decrypted weight: near 1 or 0. */
+  confidence: number[];
   upload_bytes: number;
   download_bytes: number;
-  encrypt_ms: number;
   simulate_ms: number;
   network_ms: number;
-  decrypt_ms: number;
   total_ms: number;
+  // CKKS only.
+  input_bytes?: number;
+  output_bytes?: number;
+  encrypt_ms?: number;
+  decrypt_ms?: number;
+  refreshes?: number;
+}
+
+export interface Progress {
+  step: "idle" | "encrypting" | "evaluating" | "decrypting";
+  server: {
+    contact: number;
+    contacts: number;
+    step: "gaps" | "bootstrapping" | "contact" | "output";
+    fraction: number;
+    elapsed_ms: number;
+  } | null;
 }
 
 export interface ShotResult {
@@ -69,6 +99,10 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function fetchStatus(): Promise<Status> {
   return call<Status>("/api/status");
+}
+
+export function fetchProgress(): Promise<Progress> {
+  return call<Progress>("/api/progress");
 }
 
 /** Has the shot `state` on hole `hole` (index from 0) simulated by the server. */

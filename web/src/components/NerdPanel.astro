@@ -66,18 +66,23 @@ const block = "mt-1 break-all rounded bg-zinc-100 px-2 py-1.5 leading-relaxed da
     <section class={section}>
       <h2 class={heading}>fhe</h2>
       <div class={row}><span class={label}>scheme</span><span data-stat="fheScheme">–</span></div>
+      <div class={row}><span class={label}>evaluation backend</span><span data-stat="fheBackend">–</span></div>
+      <div class={row}><span class={label}>client backend</span><span data-stat="fheClientBackend">–</span></div>
       <div class={row}><span class={label}>client</span><span data-stat="fheClient">–</span></div>
       <div class={row}><span class={label}>server</span><span data-stat="fheServer">–</span></div>
-      <div class={row}><span class={label}>simulation</span><span data-stat="fheSimulation">–</span></div>
-      <div class={row}><span class={label}>evaluation key</span><span data-stat="fheKey">–</span></div>
+      <div class={row}><span class={label}>circuit</span><span data-stat="fheCircuit">–</span></div>
+      <div class={row}><span class={label}>evaluation keys</span><span data-stat="fheKey">–</span></div>
+      <div class={row}><span class={label}>keygen / server prepare</span><span data-stat="fheKeyTimes">–</span></div>
       <div class={`${label} mt-2`}>last shot</div>
-      <div class={row}><span class={label}>shot / trajectory ciphertexts</span><span data-stat="fheCiphertexts">–</span></div>
-      <div class={row}><span class={label}>sent / received</span><span data-stat="fheTraffic">–</span></div>
+      <div class={row}><span class={label}>shot / contact ciphertexts</span><span data-stat="fheCiphertexts">–</span></div>
       <div class={row}><span class={label}>encrypt</span><span data-stat="fheEncrypt">–</span></div>
       <div class={row}><span class={label}>simulate (server)</span><span data-stat="fheSimulate">–</span></div>
+      <div class={row}><span class={label}>bootstraps</span><span data-stat="fheRefresh">–</span></div>
       <div class={row}><span class={label}>decrypt</span><span data-stat="fheDecrypt">–</span></div>
       <div class={row}><span class={label}>transport / total</span><span data-stat="fheTotal">–</span></div>
-      <div class={row}><span class={label}>contacts used / slots</span><span data-stat="fheContacts">–</span></div>
+      <div class={row}><span class={label}>contacts / slots</span><span data-stat="fheContacts">–</span></div>
+      <div class={`${label} mt-2`}>contact weights (decrypted)</div>
+      <div class={block} data-stat="fheConfidence">–</div>
     </section>
   </div>
 </aside>
