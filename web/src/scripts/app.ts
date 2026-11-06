@@ -240,8 +240,24 @@ $("new-round").addEventListener("click", () => {
 
 // --- Keyboard ---------------------------------------------------------------------
 
-/** W A S D move the view across the course. */
-const PAN_KEYS: Record<string, [number, number]> = { w: [0, 1], s: [0, -1], a: [-1, 0], d: [1, 0] };
+/**
+ * The keys where W A S D sit on a QWERTY keyboard move the view across the
+ * course: matched by position, whatever the layout prints on them (Z Q S D on
+ * AZERTY, , A O E on Dvorak).
+ */
+const PAN_KEYS: Record<string, [number, number]> = { KeyW: [0, 1], KeyS: [0, -1], KeyA: [-1, 0], KeyD: [1, 0] };
+
+/** Shows the letters the user's layout prints on the movement keys, where the browser tells. */
+async function labelPanKeys() {
+  const keyboard = (navigator as Navigator & { keyboard?: { getLayoutMap(): Promise<Map<string, string>> } }).keyboard;
+  try {
+    const map = await keyboard?.getLayoutMap();
+    if (!map) return;
+    const label = ["KeyW", "KeyA", "KeyS", "KeyD"].map((code) => (map.get(code) ?? "?").toUpperCase()).join(" ");
+    $("pan-keys").textContent = label;
+  } catch {}
+}
+labelPanKeys();
 
 window.addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -253,8 +269,8 @@ window.addEventListener("keydown", (e) => {
   } else if (phase === "aiming" && aim && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
     const step = e.shiftKey ? 0.005 : 0.02;
     view.setAim({ ...aim, power: Math.min(1, Math.max(0, aim.power + (e.key === "ArrowUp" ? step : -step))) });
-  } else if (PAN_KEYS[e.key.toLowerCase()]) {
-    const [dx, dy] = PAN_KEYS[e.key.toLowerCase()];
+  } else if (PAN_KEYS[e.code]) {
+    const [dx, dy] = PAN_KEYS[e.code];
     view.pan(dx * 0.25, dy * 0.25);
   } else if (e.key === " " && !e.repeat && phase === "aiming" && aim) {
     void shoot(aim);
