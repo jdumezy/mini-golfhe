@@ -82,6 +82,8 @@ struct ClientStatus {
     scheme: &'static str,
     backend: &'static str,
     params: Option<String>,
+    /// The largest moduli against their 128-bit bounds.
+    moduli: Option<mini_golfhe_ckks::params::Moduli>,
     setup: Option<Phase>,
     keygen_ms: Option<f64>,
 }
@@ -100,6 +102,7 @@ async fn status(State(app): State<Arc<App>>) -> Json<Status> {
         scheme: app.scheme.name(),
         backend: mini_golfhe_ckks::backend::NAME,
         params: app.ckks.as_ref().map(|c| c.params_name.clone()),
+        moduli: app.ckks.as_ref().and_then(|c| c.moduli),
         setup: app.ckks.as_ref().map(|c| c.phase()),
         keygen_ms: app.ckks.as_ref().and_then(|c| *c.keygen_ms.lock().unwrap()),
     };

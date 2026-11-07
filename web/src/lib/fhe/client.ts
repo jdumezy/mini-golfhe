@@ -14,12 +14,25 @@ export type SetupPhase =
   | { phase: "waiting_for_server"; error: string }
   | { phase: "failed"; error: string };
 
+export interface Moduli {
+  max_key: number;
+  max_ciphertext: number;
+  bound: number;
+  hamming_weight: number;
+  sparse_key: number | null;
+  sparse_bound: number;
+  sparse_hamming_weight: number;
+  log_n: number;
+}
+
 export interface Status {
   client: {
     version: string;
     scheme: string;
     backend: string;
     params: string | null;
+    /** The largest moduli against their 128-bit bounds, in bits. */
+    moduli: Moduli | null;
     setup: SetupPhase | null;
     keygen_ms: number | null;
   };

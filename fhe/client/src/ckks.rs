@@ -50,6 +50,7 @@ pub enum Phase {
 
 pub struct CkksClient {
     pub params_name: String,
+    pub moduli: Option<mini_golfhe_ckks::params::Moduli>,
     keyed: OnceLock<Keyed>,
     phase: Mutex<Phase>,
     upload_progress: Arc<AtomicU64>,
@@ -94,6 +95,7 @@ impl CkksClient {
     pub fn start(params: Params, server_addr: String) -> Arc<CkksClient> {
         let client = Arc::new(CkksClient {
             params_name: params.name.clone(),
+            moduli: params.moduli(),
             keyed: OnceLock::new(),
             phase: Mutex::new(Phase::Preparing),
             upload_progress: Arc::new(AtomicU64::new(0)),

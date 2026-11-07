@@ -237,6 +237,10 @@ export class CourseView extends EventTarget {
     resolve: () => void;
   } | null = null;
 
+  /** Keyboard panning: the velocity the held keys ask for, screen-relative, and the one reached. */
+  private panIntent: [number, number] = [0, 0];
+  private panVelocity: [number, number] = [0, 0];
+  private lastFrame: number | null = null;
   private frames = 0;
   private fpsWindowStart = performance.now();
   private fps = 0;
@@ -609,6 +613,28 @@ export class CourseView extends EventTarget {
     return this.raycaster.ray.intersectPlane(plane, new THREE.Vector3());
   }
 
+  /**
+   * Pans continuously while keys are held: `dx` right and `dy` forward as seen
+   * on screen, each in [−1, 1], at a speed that follows the zoom.
+   */
+  setPanIntent(dx: number, dy: number) {
+    const norm = Math.hypot(dx, dy);
+    this.panIntent = norm > 1 ? [dx / norm, dy / norm] : [dx, dy];
+  }
+
+  /** Eases the panning velocity towards the held keys' and moves the view by it. */
+  private stepPan(dt: number) {
+    const speed = 0.6 * this.distance;
+    // Reaches the held keys' velocity, or a stop, in about a tenth of a second.
+    const ease = 1 - Math.exp(-dt / 0.08);
+    const v = this.panVelocity;
+    for (const i of [0, 1]) {
+      v[i] += (this.panIntent[i] * speed - v[i]) * ease;
+      if (this.panIntent[i] === 0 && Math.abs(v[i]) < 1e-3) v[i] = 0;
+    }
+    if (v[0] || v[1]) this.pan(v[0] * dt, v[1] * dt);
+  }
+
   /** Moves the view across the course, `dx` right and `dy` forward as seen on screen, in metres. */
   pan(dx: number, dy: number) {
     const [c, s] = [Math.cos(this.heading), Math.sin(this.heading)];
@@ -744,6 +770,10 @@ export class CourseView extends EventTarget {
   }
 
   private frame(now: number) {
+    // Capped, so that a frame after the tab was hidden does not leap.
+    const dt = this.lastFrame === null ? 0 : Math.min(0.05, (now - this.lastFrame) / 1000);
+    this.lastFrame = now;
+    this.stepPan(dt);
     if (this.playing) this.animate(now);
     this.renderer.render(this.scene, this.camera);
     this.frames++;

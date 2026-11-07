@@ -11,7 +11,7 @@ use crate::backend::{Be, Dev};
 use crate::preset::Preset;
 
 /// Largest modulus of a key under the dense secret, for 128-bit security at `N = 2^16`.
-const MAX_KEY_MODULUS: usize = 1707;
+const MAX_KEY_MODULUS: usize = crate::preset::DENSE_MAX_MODULUS;
 
 /// Failure probability `2^-128` per bootstrap when adapting the radix to the backend.
 const BOOTSTRAP_FAILURE_BITS: usize = 128;
@@ -24,6 +24,24 @@ pub const USABLE_BITS: usize = 700;
 /// modulus raise: four small factors instead of the preset's three of five
 /// layers, about a third faster on a GPU (measured on Metal), with smaller keys.
 const FIRST_FACTOR_ON_RAISE: [(usize, usize); 4] = [(3, 1), (4, 1024), (4, 64), (4, 4)];
+
+/// The largest moduli of a parameter set against the 128-bit bounds of their
+/// secrets, in bits.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct Moduli {
+    /// The widest key under the dense secret.
+    pub max_key: usize,
+    /// The widest ciphertext: the bootstrap's working width, or a fresh one.
+    pub max_ciphertext: usize,
+    /// Bound for the dense secret.
+    pub bound: usize,
+    pub hamming_weight: usize,
+    /// The bootstrap's key under its sparse secret, and that secret's bound and weight.
+    pub sparse_key: Option<usize>,
+    pub sparse_bound: usize,
+    pub sparse_hamming_weight: usize,
+    pub log_n: usize,
+}
 
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -111,6 +129,29 @@ impl Params {
 
     pub fn n(&self) -> usize {
         1 << self.log_n
+    }
+
+    /// The largest moduli against the 128-bit bounds; `None` for the insecure
+    /// test parameters, which have no bound.
+    pub fn moduli(&self) -> Option<Moduli> {
+        use crate::preset::{DENSE_MAX_MODULUS, SPARSE_HAMMING_WEIGHT, SPARSE_MAX_MODULUS};
+        let preset = self.bootstrap.as_deref()?;
+        let total = |l: &poulpy_core::layouts::GGLWELayout| {
+            l.k_offset.as_usize() + l.dnum.as_usize() * l.k_digit.as_usize() + l.k_aux.as_usize()
+        };
+        let keys = preset.key_moduli().ok()?;
+        let dense = keys.iter().filter(|(_, _, limit)| *limit == DENSE_MAX_MODULUS).map(|(_, l, _)| total(l));
+        let sparse = keys.iter().filter(|(_, _, limit)| *limit == SPARSE_MAX_MODULUS).map(|(_, l, _)| total(l));
+        Some(Moduli {
+            max_key: dense.chain([self.key_modulus()]).max()?,
+            max_ciphertext: preset.bootstrap_k.max(self.fresh_k),
+            bound: DENSE_MAX_MODULUS,
+            hamming_weight: self.hamming_weight,
+            sparse_key: sparse.max(),
+            sparse_bound: SPARSE_MAX_MODULUS,
+            sparse_hamming_weight: SPARSE_HAMMING_WEIGHT,
+            log_n: self.log_n,
+        })
     }
 
     /// Complex slots of a ciphertext.

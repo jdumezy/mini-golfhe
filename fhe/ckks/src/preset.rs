@@ -14,10 +14,10 @@ use poulpy_core::layouts::{Base2K, Degree, GGLWEInfos, GGLWELayout, Rank, TorusP
 
 /// Largest modulus, in bits, for 128-bit security at `N = 2^16`, by secret
 /// Hamming weight (sparse-key-estimate table).
-const DENSE_HAMMING_WEIGHT: usize = 1024;
-const DENSE_MAX_MODULUS: usize = 1707;
-const SPARSE_HAMMING_WEIGHT: usize = 32;
-const SPARSE_MAX_MODULUS: usize = 345;
+pub const DENSE_HAMMING_WEIGHT: usize = 1024;
+pub const DENSE_MAX_MODULUS: usize = 1707;
+pub const SPARSE_HAMMING_WEIGHT: usize = 32;
+pub const SPARSE_MAX_MODULUS: usize = 345;
 
 /// Bits a key keeps between its modulus and the input plus one digit (as in
 /// poulpy's presets).

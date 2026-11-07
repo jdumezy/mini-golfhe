@@ -235,6 +235,12 @@ fn secure_parameters_fit_the_modulus_bounds() {
         }
     }
     eprintln!("largest dense-secret key: {} bits", worst.0);
+    // What the client reports.
+    let m = params.moduli().unwrap();
+    eprintln!("{m:?}");
+    assert_eq!(m.max_key, worst.0);
+    assert!(m.max_key <= m.bound && m.max_ciphertext <= m.bound);
+    assert!(m.sparse_key.is_some_and(|k| k <= m.sparse_bound));
 }
 
 /// Runs every operation under CKKS and in the simulator, and reports the

@@ -2759,6 +2759,7 @@ dependencies = [
  "poulpy-gpu-portable",
  "poulpy-hal",
  "rayon",
+ "serde",
 ]
 
 [[package]]

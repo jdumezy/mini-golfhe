@@ -259,6 +259,27 @@ async function labelPanKeys() {
 }
 labelPanKeys();
 
+/** The movement keys held down, by position. */
+const heldPanKeys = new Set<string>();
+
+function updatePan() {
+  let [dx, dy] = [0, 0];
+  for (const code of heldPanKeys) {
+    dx += PAN_KEYS[code][0];
+    dy += PAN_KEYS[code][1];
+  }
+  view.setPanIntent(dx, dy);
+}
+
+window.addEventListener("keyup", (e) => {
+  if (heldPanKeys.delete(e.code)) updatePan();
+});
+// A key released while the window was in the background never sends its keyup.
+window.addEventListener("blur", () => {
+  heldPanKeys.clear();
+  updatePan();
+});
+
 window.addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.target instanceof HTMLElement && e.target.closest("input, textarea, [contenteditable]")) return;
@@ -270,8 +291,8 @@ window.addEventListener("keydown", (e) => {
     const step = e.shiftKey ? 0.005 : 0.02;
     view.setAim({ ...aim, power: Math.min(1, Math.max(0, aim.power + (e.key === "ArrowUp" ? step : -step))) });
   } else if (PAN_KEYS[e.code]) {
-    const [dx, dy] = PAN_KEYS[e.code];
-    view.pan(dx * 0.25, dy * 0.25);
+    heldPanKeys.add(e.code);
+    updatePan();
   } else if (e.key === " " && !e.repeat && phase === "aiming" && aim) {
     void shoot(aim);
   } else if (e.key === "Enter" && !e.repeat && phase === "holed") {
@@ -364,7 +385,18 @@ async function refreshClientStatus() {
   clearTimeout(statusTimer);
   if (!s) {
     clientSetup = null;
-    for (const name of ["fheScheme", "fheBackend", "fheClientBackend", "fheServer", "fheCircuit", "fheKey", "fheKeyTimes"])
+    for (const name of [
+      "fheScheme",
+      "fheBackend",
+      "fheClientBackend",
+      "fheServer",
+      "fheCircuit",
+      "fheModulus",
+      "fheBound",
+      "fheSparse",
+      "fheKey",
+      "fheKeyTimes",
+    ])
       stat(name).textContent = "–";
     stat("fheClient").textContent = "not running";
     return;
@@ -388,6 +420,11 @@ async function refreshClientStatus() {
   stat("fheCircuit").textContent = info
     ? `${info.max_contacts} contacts × ${info.steps} steps of ${(info.dt * 1000).toFixed(0)} ms × 32 faces`
     : "–";
+  const m = client.moduli;
+  stat("fheModulus").textContent = m ? `${m.max_key} / ${m.max_ciphertext} bits` : "–";
+  stat("fheBound").textContent = m ? `${m.bound} bits (N = 2^${m.log_n}, secret weight ${m.hamming_weight})` : "–";
+  stat("fheSparse").textContent =
+    m?.sparse_key != null ? `${m.sparse_key} / ${m.sparse_bound} bits (weight ${m.sparse_hamming_weight})` : "–";
   stat("fheKey").textContent = setup?.phase === "ready" ? formatBytes(setup.key_bytes) : "–";
   stat("fheKeyTimes").textContent =
     setup?.phase === "ready" && client.keygen_ms

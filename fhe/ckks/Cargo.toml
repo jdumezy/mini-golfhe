@@ -11,6 +11,7 @@ poulpy-hal.workspace = true
 poulpy-core.workspace = true
 poulpy-ckks.workspace = true
 rayon = "1"
+serde.workspace = true
 
 # One backend per target, the fastest the build's target features allow.
 [target.'cfg(target_arch = "aarch64")'.dependencies]
