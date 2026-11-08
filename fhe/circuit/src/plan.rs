@@ -125,6 +125,27 @@ pub struct Plan {
     /// The first slot of each window.
     pub window_starts: Vec<f64>,
     pub is_positive: Poly,
+    /// The scale of the bounces off several faces of a block at once, for the
+    /// blocks whose faces do not meet at right angles (none: `None`).
+    pub multi_face: Option<MultiFace>,
+}
+
+/// The data of [`mini_golfhe_course::Detector::multi_face_scale`] on the grid
+/// (window 0), at each scaled block's first face: the faces it was in front
+/// of [`FACE_LAG`] steps before are counted by a segmented sum over the
+/// block's faces, and a count other than one scales its bounce.
+#[derive(Clone, Debug)]
+pub struct MultiFace {
+    /// `masks[i]`: the slots `2^i` faces or more before their block's last.
+    pub masks: Vec<Vec<f64>>,
+    /// The block's face count.
+    pub counts: Vec<f64>,
+    /// `1 − scale`, and the scale (1 in every other slot).
+    pub one_minus_scale: Vec<f64>,
+    pub scale: Vec<f64>,
+    /// 1 at a count of one, 0 at the other counts up to the most faces a
+    /// point can be in front of together.
+    pub is_one: Poly,
 }
 
 impl Plan {
@@ -231,6 +252,43 @@ impl Plan {
             .map(|i| mask(1, &|_, f| hole.detectors.iter().any(|d| !d.rail && d.count > i && d.first + i == f)))
             .collect();
 
+        let scaled: Vec<_> = hole.detectors.iter().filter(|d| !d.rail && d.multi_face_scale < 1.0 - 1e-12).collect();
+        let multi_face = (!scaled.is_empty()).then(|| {
+            let widest = scaled.iter().map(|d| d.count).max().unwrap();
+            let grid = |value: &dyn Fn(usize) -> Option<f64>, rest: f64| -> Vec<f64> {
+                let mut v = vec![rest; SLOTS];
+                for k in 0..STEPS {
+                    for f in 0..FACES {
+                        if let Some(x) = value(f) {
+                            v[slot(k, f)] = x;
+                        }
+                    }
+                }
+                v
+            };
+            let first = |f: usize| scaled.iter().find(|d| d.first == f);
+            MultiFace {
+                masks: (0..)
+                    .map(|i| 1usize << i)
+                    .take_while(|&d| d < widest)
+                    .map(|d| {
+                        grid(&|f| scaled.iter().any(|b| b.first <= f && f + d < b.first + b.count).then_some(1.0), 0.0)
+                    })
+                    .collect(),
+                counts: grid(&|f| first(f).map(|d| d.count as f64), 0.0),
+                one_minus_scale: grid(&|f| first(f).map(|d| 1.0 - d.multi_face_scale), 0.0),
+                scale: grid(&|f| first(f).map(|d| d.multi_face_scale), 1.0),
+                // Exact on the counts a bounce can see, `1..=longest` (a count of 0 bounces off no face).
+                is_one: {
+                    let longest =
+                        scaled.iter().map(|d| mini_golfhe_course::front_runs(d.faces(&hole.faces)).1).max().unwrap();
+                    Poly::interpolate((longest - 1).max(1), 0.0, 8.0, |x| {
+                        (2..=longest).map(|m| (x - m as f64) / (1.0 - m as f64)).product()
+                    })
+                },
+            }
+        });
+
         let mut step_time = vec![0.0; SLOTS];
         for k in 0..STEPS {
             step_time[slot(k, 0)] = k as f64 * flow.dt;
@@ -260,6 +318,7 @@ impl Plan {
             step_time,
             window_starts,
             is_positive: poly::is_positive(MAX_INSIDE),
+            multi_face,
         })
     }
 }

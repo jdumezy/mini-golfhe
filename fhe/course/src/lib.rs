@@ -160,6 +160,41 @@ pub struct Detector {
     pub count: usize,
     pub rail: bool,
     pub restitution: f64,
+    /// What a bounce off two faces or more of the block at once is multiplied
+    /// by: `1/λ`, `λ` the largest eigenvalue of `Σ n·nᵀ` over the runs of
+    /// faces a point outside can be in front of together (at least 1). Each
+    /// face then reflects its share of the velocity and the bounce never adds
+    /// speed; 1 for blocks whose adjacent faces meet at right angles.
+    pub multi_face_scale: f64,
+}
+
+/// The `multi_face_scale` of a convex block of `faces`, counter-clockwise, and
+/// the most faces a point outside can be in front of together.
+pub fn front_runs(faces: &[Face]) -> (f64, usize) {
+    let n = faces.len();
+    let (mut largest, mut longest) = (1.0f64, 1usize);
+    for start in 0..n {
+        let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+        for len in 1..n {
+            let f = &faces[(start + len - 1) % n];
+            // A point is in front of a run of faces only if their normals lie in
+            // an open half-plane: the run turns by less than half a turn.
+            let first = &faces[start];
+            let turn = (first.n[0] * f.n[1] - first.n[1] * f.n[0]).atan2(first.n[0] * f.n[0] + first.n[1] * f.n[1]);
+            if len > 1 && turn.rem_euclid(std::f64::consts::TAU) >= std::f64::consts::PI - 1e-9 {
+                break;
+            }
+            longest = longest.max(len);
+            sxx += f.n[0] * f.n[0];
+            sxy += f.n[0] * f.n[1];
+            syy += f.n[1] * f.n[1];
+            if len >= 2 {
+                let (m, d) = ((sxx + syy) / 2.0, ((sxx - syy) / 2.0).hypot(sxy));
+                largest = largest.max(m + d);
+            }
+        }
+    }
+    (1.0 / largest, longest)
 }
 
 impl Detector {
@@ -201,7 +236,13 @@ fn detectors(obstacles: &[Obstacle]) -> (Vec<Face>, Vec<Detector>) {
         match o {
             Obstacle::Rail { faces: fs, restitution } => {
                 for f in fs {
-                    detectors.push(Detector { first: faces.len(), count: 1, rail: true, restitution: *restitution });
+                    detectors.push(Detector {
+                        first: faces.len(),
+                        count: 1,
+                        rail: true,
+                        restitution: *restitution,
+                        multi_face_scale: 1.0,
+                    });
                     faces.push(*f);
                 }
             }
@@ -211,6 +252,7 @@ fn detectors(obstacles: &[Obstacle]) -> (Vec<Face>, Vec<Detector>) {
                     count: fs.len(),
                     rail: false,
                     restitution: *restitution,
+                    multi_face_scale: front_runs(fs).0,
                 });
                 faces.extend(fs);
             }
@@ -345,6 +387,21 @@ mod tests {
         let course = Course::get();
         assert_eq!(course.holes.len(), 18);
         assert!(course.holes.iter().all(|h| matches!(h.obstacles[0], Obstacle::Rail { .. })));
+    }
+
+    #[test]
+    fn multi_face_bounces_are_scaled_off_right_angles_only() {
+        let square = polygon_faces(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], false, 0.0);
+        assert_eq!(front_runs(&square).1, 2);
+        assert!((front_runs(&square).0 - 1.0).abs() < 1e-12);
+        // An octagon's faces facing a point span up to 135°: `Σ n·nᵀ` reaches 2.
+        let post = polygon_faces(&octagon([0.0, 0.0], 0.2), false, 0.0);
+        assert_eq!(front_runs(&post).1, 4);
+        assert!((front_runs(&post).0 - 0.5).abs() < 1e-9, "{:?}", front_runs(&post));
+        let course = Course::get();
+        let scales: Vec<f64> =
+            course.holes.iter().flat_map(|h| h.detectors.iter().map(|d| d.multi_face_scale)).collect();
+        assert!(scales.iter().all(|&s| s > 0.0 && s <= 1.0));
     }
 
     #[test]

@@ -16,9 +16,11 @@ const MAX_KEY_MODULUS: usize = crate::preset::DENSE_MAX_MODULUS;
 /// Failure probability `2^-128` per bootstrap when adapting the radix to the backend.
 const BOOTSTRAP_FAILURE_BITS: usize = 128;
 
-/// Bits each half of a contact may consume between two bootstraps: the
-/// deeper half takes about 16 levels of 35 bits and four plaintext masks.
-pub const USABLE_BITS: usize = 700;
+/// Bits each half of a contact may consume between two bootstraps, rounded up
+/// to whole limbs: 27 limbs for the bootstrap, 811-bit ciphertexts. The first
+/// half leaves 6 bits to spare, the second, whose prefix product runs at a
+/// coarser scale, 44.
+pub const USABLE_BITS: usize = 647;
 
 /// CoeffsToSlots as `(layers, giant step)` factors, the first applied by the
 /// modulus raise: four small factors instead of the preset's three of five
@@ -104,7 +106,9 @@ impl Params {
             base2k: preset.base2k,
             log_delta: preset.log_delta,
             pt_log_delta: 24,
-            poly_log_delta: preset.log_delta,
+            // Polynomial coefficients exact to 2^-28: the error stays far
+            // below the ciphertexts' and each constant product spends 7 bits less.
+            poly_log_delta: 28,
             fresh_k: preset.output_k,
             hamming_weight: preset.dense_hamming_weight,
             bootstrap: Some(Arc::new(preset)),

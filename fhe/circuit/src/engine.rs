@@ -48,6 +48,16 @@ pub trait Engine: Sync {
 
     /// Bootstraps `a`: same values, capacity restored.
     fn refresh(&self, a: &Self::Ct) -> Result<Self::Ct>;
+
+    /// `a` at a coarser scale: its products spend fewer bits, with more noise.
+    fn coarsen(&self, a: &Self::Ct) -> Result<Self::Ct> {
+        self.copy(a)
+    }
+
+    /// `a`, at a coarser scale, back at the circuit's scale.
+    fn refine(&self, a: &Self::Ct) -> Result<Self::Ct> {
+        self.copy(a)
+    }
 }
 
 /// Exact evaluation on plaintext slot vectors, with unbounded capacity.

@@ -10,7 +10,13 @@ use poulpy_ckks::approximation::sign_composite_coeffs;
 pub struct Poly {
     pub cheb: Vec<f64>,
     pub interval: (f64, f64),
+    /// Whether the result tolerates coefficients to [`RELAXED_COEFF_BITS`]
+    /// and one more level: an engine may evaluate it with fewer products.
+    pub relaxed: bool,
 }
+
+/// Bits of the coefficients of a [`Poly::relaxed`] polynomial.
+pub const RELAXED_COEFF_BITS: usize = 16;
 
 impl Poly {
     pub fn degree(&self) -> usize {
@@ -45,14 +51,14 @@ impl Poly {
                 s * if k == 0 { 1.0 } else { 2.0 } / n as f64
             })
             .collect();
-        Poly { cheb, interval: (lo, hi) }
+        Poly { cheb, interval: (lo, hi), relaxed: false }
     }
 
     /// `a + b · p(x)`.
     pub fn affine(&self, a: f64, b: f64) -> Poly {
         let mut cheb: Vec<f64> = self.cheb.iter().map(|c| b * c).collect();
         cheb[0] += a;
-        Poly { cheb, interval: self.interval }
+        Poly { cheb, interval: self.interval, relaxed: self.relaxed }
     }
 }
 
@@ -70,7 +76,10 @@ pub fn sign() -> &'static [Poly] {
         schedules
             .iter()
             .filter_map(|degrees| sign_composite_coeffs::<f64>(tau, SIGN_BITS, degrees, 8).ok())
-            .map(|rows| rows.into_iter().map(|cheb| Poly { cheb, interval: (-1.0, 1.0) }).collect::<Vec<_>>())
+            // Relaxed: the smoothstep after the last factor flattens their error near 0 and 1.
+            .map(|rows| {
+                rows.into_iter().map(|cheb| Poly { cheb, interval: (-1.0, 1.0), relaxed: true }).collect::<Vec<_>>()
+            })
             .min_by_key(|factors| {
                 (factors.iter().map(Poly::depth).sum::<usize>(), factors.iter().map(Poly::degree).sum::<usize>())
             })

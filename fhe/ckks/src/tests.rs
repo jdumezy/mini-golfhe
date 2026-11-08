@@ -51,9 +51,14 @@ impl<'a> Timed<'a> {
         Timed { inner, times: Default::default(), budgets: Default::default() }
     }
 
-    fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
+    fn time<T: Budgeted>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
         let out = f();
+        if std::env::var("BUDGET_TRACE").is_ok()
+            && let Some(b) = out.budget(self.inner)
+        {
+            eprintln!("    trace {op} {b}");
+        }
         self.inner.synchronize();
         let mut times = self.times.lock().unwrap();
         let entry = times.entry(op).or_default();
@@ -74,6 +79,20 @@ impl<'a> Timed<'a> {
 }
 
 type R<T> = anyhow::Result<T>;
+
+/// The budget of an operation's result, for [`Timed`]'s trace.
+trait Budgeted {
+    fn budget(&self, _: &CkksEngine) -> Option<usize> {
+        None
+    }
+}
+impl Budgeted for R<DeviceCiphertext> {
+    fn budget(&self, e: &CkksEngine) -> Option<usize> {
+        self.as_ref().ok().map(|c| e.log_budget(c))
+    }
+}
+impl Budgeted for R<()> {}
+impl Budgeted for R<crate::engine::DeviceRotations> {}
 
 impl Engine for Timed<'_> {
     type Ct = DeviceCiphertext;
@@ -135,6 +154,12 @@ impl Engine for Timed<'_> {
     fn refresh(&self, a: &Self::Ct) -> R<Self::Ct> {
         self.budgets.lock().unwrap().push(self.inner.log_budget(a));
         self.time("bootstrap", || self.inner.refresh(a))
+    }
+    fn coarsen(&self, a: &Self::Ct) -> R<Self::Ct> {
+        self.time("add/copy", || self.inner.coarsen(a))
+    }
+    fn refine(&self, a: &Self::Ct) -> R<Self::Ct> {
+        self.time("add/copy", || self.inner.refine(a))
     }
 }
 
@@ -340,6 +365,12 @@ impl Engine for Shadow<'_> {
     fn refresh(&self, a: &Self::Ct) -> R<Self::Ct> {
         Ok(self.check("refresh", (self.engine.refresh(&a.0)?, a.1.clone())))
     }
+    fn coarsen(&self, a: &Self::Ct) -> R<Self::Ct> {
+        Ok(self.check("coarsen", (self.engine.coarsen(&a.0)?, a.1.clone())))
+    }
+    fn refine(&self, a: &Self::Ct) -> R<Self::Ct> {
+        Ok(self.check("refine", (self.engine.refine(&a.0)?, a.1.clone())))
+    }
 }
 
 #[test]
@@ -352,4 +383,44 @@ fn shadow_one_contact() {
     let shot = encode_state(&[-1.9, 0.0, 2.5, 1.2]);
     let start = (engine.upload(&engine.ring.encrypt(&sk, &shot, [3; 32]).unwrap()), shot);
     evaluate(&shadow, &prepared, &start, |_| {}).unwrap();
+}
+
+/// Diagnostic: the state error of the encrypted contacts against the
+/// simulator over several shots.
+#[test]
+#[ignore = "diagnostic: CKKS accuracy over several shots"]
+fn accuracy_over_shots() {
+    let params = Params::secure().unwrap();
+    let plan = plan(6, Course::get().physics.max_contacts);
+    let (engine, sk) = setup(params, &plan);
+    let n: usize = std::env::var("ACCURACY_SHOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let shots: Vec<State> = (0..n)
+        .map(|i| {
+            let a = i as f64 * 2.399;
+            let v = 0.6 + 3.4 * ((i * 7 % 11) as f64 / 10.0);
+            [-1.9 + 0.2 * (i % 5) as f64, 0.3 * (i % 3) as f64 - 0.3, v * a.cos(), v * a.sin()]
+        })
+        .collect();
+    {
+        let prepared = Prepared::new(&engine, &plan).unwrap();
+        let (mut errors, mut worst) = (Vec::new(), 0.0f64);
+        for s in &shots {
+            let start = engine.upload(&engine.ring.encrypt(&sk, &encode_state(s), [3; 32]).unwrap());
+            let outputs = evaluate(&engine, &prepared, &start, |_| {}).unwrap();
+            for (ct, w) in outputs.iter().zip(&simulate(&plan, s)) {
+                let g = decode_contact(&engine.ring.decrypt(&sk, &engine.download(ct).unwrap()).unwrap());
+                let w = decode_contact(w);
+                let e = (g.state[0] - w.state[0]).hypot(g.state[1] - w.state[1]);
+                errors.push(e);
+                worst = worst.max(e);
+            }
+        }
+        errors.sort_by(f64::total_cmp);
+        eprintln!(
+            "position error median {:.2e}, 90th percentile {:.2e}, worst {worst:.2e} over {} contacts",
+            errors[errors.len() / 2],
+            errors[errors.len() * 9 / 10],
+            errors.len()
+        );
+    }
 }

@@ -114,13 +114,17 @@ pub const FACE_LAG: usize = 3;
 /// The change of state `s` takes bouncing off detector `d`, entered at this
 /// step (`prev` is the state [`FACE_LAG`] steps before, or at the segment's
 /// start): off every face the ball came through, the faces it was still in
-/// front of then (a rail has one).
+/// front of then (a rail has one). Off two faces or more, the sum is scaled
+/// by the block's [`Detector::multi_face_scale`], so that it adds no speed.
 pub fn bounce(hole: &Hole, d: &Detector, s: &State, prev: &State) -> State {
     let [x, y, vx, vy] = *s;
     let mut delta = [0.0; 4];
-    let k = 1.0 + d.restitution;
-    for f in d.faces(&hole.faces) {
-        if d.rail || f.clearance(prev[0], prev[1]) >= 0.0 {
+    let faces = d.faces(&hole.faces);
+    let in_front = |f: &mini_golfhe_course::Face| d.rail || f.clearance(prev[0], prev[1]) >= 0.0;
+    let several = faces.iter().filter(|f| in_front(f)).count() >= 2;
+    let k = (1.0 + d.restitution) * if several { d.multi_face_scale } else { 1.0 };
+    for f in faces {
+        if in_front(f) {
             // Reflect the normal velocity and mirror the penetration, both scaled by 1 + e.
             let (depth, vn) = (f.clearance(x, y), f.n[0] * vx + f.n[1] * vy);
             delta[0] -= k * depth * f.n[0];

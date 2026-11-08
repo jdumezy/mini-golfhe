@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use mini_golfhe_circuit::poly::Poly;
+use mini_golfhe_circuit::poly::{Poly, RELAXED_COEFF_BITS};
 use mini_golfhe_circuit::{Engine, Prepared, Rotations as CircuitRotations, evaluate};
 use poulpy_ckks::api::{
     CKKSAllOpsTmpBytes, CKKSBootstrappingOps, CKKSCopyOps, CKKSEncodingHostOps, CKKSInnerSumOps,
@@ -74,6 +74,9 @@ pub struct DeviceRotations(LinearTransformationBabySteps<Dev>);
 type Word = <Be as Backend>::ZnxWord;
 type Buf = <Be as Backend>::OwnedBuf;
 type DevBuf = <Dev as Backend>::OwnedBuf;
+
+/// Scale of [`Engine::coarsen`]: noise about `2^-17` of the values.
+const COARSE_LOG_DELTA: usize = 30;
 
 /// Extra bits above the plaintext precision, for the integer part of codes (≤ 18).
 const PT_INTEGER_BITS: usize = 8;
@@ -454,8 +457,11 @@ impl Engine for CkksEngine {
         let bsgs = Polynomial::new(Basis::Chebyshev, poly.cheb.clone()).encode_bsgs_with(
             &host,
             p.base2k.into(),
-            CoeffsMeta::from_delta_budget(p.poly_log_delta, PT_INTEGER_BITS),
-            SplitStrategy::MinDepth,
+            CoeffsMeta::from_delta_budget(
+                if poly.relaxed { p.poly_log_delta.min(RELAXED_COEFF_BITS) } else { p.poly_log_delta },
+                PT_INTEGER_BITS,
+            ),
+            if poly.relaxed { SplitStrategy::MinMult } else { SplitStrategy::MinDepth },
         )?;
         let bsgs = bsgs.map_baby_steps_ref(|pt| {
             let mut dev = self.module.ckks_plaintext_alloc(pt.n(), pt.base2k(), pt.k());
@@ -637,6 +643,29 @@ impl Engine for CkksEngine {
                 s,
             )?)
         })?;
+        Ok(out)
+    }
+
+    /// Drops the low bits of `a` with its scale, to [`COARSE_LOG_DELTA`]: the
+    /// budget is unchanged and products then spend that many bits.
+    fn coarsen(&self, a: &DeviceCiphertext) -> Result<DeviceCiphertext> {
+        let mut out = self.copy(a)?;
+        let drop = out.log_delta().saturating_sub(COARSE_LOG_DELTA);
+        out.set_k((out.k().as_usize() - drop).into());
+        let mut meta = out.meta();
+        meta.scale = Scale::Log(out.log_delta() - drop);
+        out.set_meta(meta);
+        Ok(out)
+    }
+
+    /// Back at the circuit's scale: `2^d · a`, read at a scale `2^d` finer
+    /// (spending `d` bits).
+    fn refine(&self, a: &DeviceCiphertext) -> Result<DeviceCiphertext> {
+        let mut out = self.copy(a)?;
+        let d = self.ring.params.log_delta.saturating_sub(out.log_delta());
+        let scratch = &mut self.scratch.lock().unwrap().1;
+        self.module.ckks_mul_pow2_assign(d, &mut out, &mut scratch.borrow())?;
+        self.module.ckks_div_pow2_assign(d, &mut out)?;
         Ok(out)
     }
 
